@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>侧边栏自检</title>
+<style>
+  body { margin: 0; padding: 14px; font: 12px/1.55 system-ui, "Microsoft YaHei"; background: #f7f8fa; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  #report { background: #0F6E56; color: #fff; padding: 12px 14px; border-radius: 10px;
+            white-space: pre-wrap; font: 12px/1.6 ui-monospace, Consolas, monospace; margin: 0; }
+</style>
+</head>
+<body>
+<h1>侧边栏自检（面板跑在"宿主模式"下的行为）</h1>
+<pre id="report">运行中…</pre>
+<script>
+// ---- 假 chrome API：形状要跟扩展环境提供的一致 ----
+var calls = [];                 // 记下调用，用来断言"确实去问了标签页"
+var msgListeners = [];
+var store = {};
+var TABS_FAIL = false;          // 想模拟"这个页面读不了"就设成 true
+window.chrome = {
+  storage: { local: {
+    get: function (k, cb) { setTimeout(function () { cb(store); }, 0); },
+    set: function (o, cb) { Object.keys(o).forEach(function (k) { store[k] = o[k]; }); if (cb) setTimeout(cb, 0); }
+  } },
+  runtime: {
+    sendMessage: function (m, cb) { if (cb) setTimeout(function () { cb({}); }, 0); },
+    onMessage: { addListener: function (fn) { msgListeners.push(fn); } },
+    lastError: null
+  },
+  tabs: {
+    query: function (q, cb) { calls.push(['query', q]); setTimeout(function () { cb([{ id: 42, windowId: 7 }]); }, 0); },
+    sendMessage: function (id, m, cb) {
+      calls.push(['sendMessage', id, m]);
+      setTimeout(function () {
+        if (TABS_FAIL) {
+          window.chrome.runtime.lastError = { message: '这个页面读不了' };
+          try { cb(null); } finally { window.chrome.runtime.lastError = null; }
+          return;
+        }
+        cb({ ok: true, title: '被读的那个页面', url: 'https://example.com/x',
+             text: '这是标签页的正文', cut: false,
+             images: ['https://example.com/a.png'], visible: '屏上那点文字' });
+      }, 0);
+    }
+  }
+};
+// 关键：在 panel.js 加载**之前**就把宿主标记立起来（侧边栏那页就是这么干的）
+window.__DS_HOST = 'sidepanel';
+</script>
+<script src="../config.js"></script>
+<script src="../panel.js"></script>
+<script>
+var host, sr, out = [], bad = 0;
+function t(name, fn) {
+  try { fn(); out.push('✓ ' + name); }
+  catch (e) { bad++; out.push('✗ ' + name + ' → ' + e.message); }
+}
+function has(name, cond, extra) {
+  out.push((cond ? '✓ ' : '✗ ') + name);
+  if (!cond) { bad++; out.push('    ' + extra); }
+}
+
+setTimeout(async function () {
+  window.__dsPanel.open();
+  host = document.getElementById('__ds_float_panel__');
+  sr = host && host.shadowRoot;
+
+  t('面板建起来了', function () { if (!sr) { throw new Error('没有 shadowRoot'); } });
+  t('宿主模式：铺满整个容器', function () {
+    if (!sr.querySelector('.wrap.fs')) { throw new Error('没有 .wrap.fs'); }
+    if (host.style.width !== window.innerWidth + 'px') {
+      throw new Error('宽度=' + host.style.width + ' 而 viewport=' + window.innerWidth);
+    }
+  });
+  t('藏掉全屏/退出，但「应用网页」留着', function () {
+    var page = sr.querySelector('#page'), fs = sr.querySelector('#fs'), ex = sr.querySelector('#exit');
+    out.push('   #page 文字=' + JSON.stringify(page.textContent) +
+             ' display=' + getComputedStyle(page).display +
+             ' | #fs=' + getComputedStyle(fs).display + ' #exit=' + getComputedStyle(ex).display);
+    if (getComputedStyle(page).display === 'none') { throw new Error('「应用网页」被藏了'); }
+    if (getComputedStyle(fs).display !== 'none') { throw new Error('#fs 没藏'); }
+    if (getComputedStyle(ex).display !== 'none') { throw new Error('#exit 没藏'); }
+  });
+  t('网页侧的服务不会在侧栏里注册（侧栏不该应答自己）', function () {
+    if (msgListeners.length) { throw new Error('侧栏里也注册了取内容监听，会自己答自己'); }
+  });
+
+  var g = await window.__dsPanel.grabContext();
+  t('侧栏里取内容 → 真的去问当前标签页', function () {
+    out.push('   调用记录 = ' + JSON.stringify(calls));
+    out.push('   拿到 = ' + JSON.stringify(g));
+    if (!calls.some(function (c) { return c[0] === 'query' && c[1].active && c[1].currentWindow; })) {
+      throw new Error('没按 {active,currentWindow} 查标签页');
+    }
+    if (!calls.some(function (c) { return c[0] === 'sendMessage' && c[1] === 42 && c[2] && c[2].type === 'ds-grab-page'; })) {
+      throw new Error('没给正确标签页发 ds-grab-page');
+    }
+    if (!g.ok || (g.text || '').indexOf('标签页的正文') < 0) { throw new Error('没拿到标签页正文'); }
+    if (g.windowId !== 7) { throw new Error('windowId 没带上（截图要用它定位窗口）'); }
+  });
+
+  TABS_FAIL = true;
+  var g2 = await window.__dsPanel.grabContext();
+  t('读不到的页面要明确失败，不能假装成功', function () {
+    if (g2.ok) { throw new Error('居然返回成功'); }
+    out.push('   失败原因 = ' + JSON.stringify(g2.error));
+  });
+
+  // ---- 点「应用网页」：侧栏里必须去读**当前标签页** ----
+  // 这一步以前是直接调 grabPage()（读侧栏自己的 document），于是提示里写"0 字"、
+  // chip 上挂着侧栏自己的标题 —— 真发出去的内容是对的（发送时才走 grabContext），
+  // 但点下去那一下的反馈是假的。这条断言就是把它钉住。
+  TABS_FAIL = false;
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  sr.querySelector('#page').click();          // 关 → 整页
+  await wait(80);
+  t('点「应用网页」→ 整页模式读的是当前标签页', function () {
+    var chip = sr.querySelector('.chip.page');
+    var toastText = sr.querySelector('#toast').textContent;
+    out.push('   chip  = ' + JSON.stringify(chip ? chip.textContent : null));
+    out.push('   toast = ' + JSON.stringify(toastText));
+    if (!chip) { throw new Error('没出现 .chip.page'); }
+    if (chip.textContent.indexOf('被读的那个页面') < 0) {
+      throw new Error('chip 上的标题不是标签页的 → 读成了侧栏自己');
+    }
+    if (chip.textContent.indexOf('1 图') < 0) { throw new Error('图片数不对'); }
+    if (toastText.indexOf('8 字') < 0) { throw new Error('提示里的字数不是标签页正文的 8 字'); }
+  });
+
+  sr.querySelector('#page').click();          // 整页 → 可见区
+  await wait(80);
+  t('再点一下 → 可见区模式，读的还是标签页', function () {
+    var chip = sr.querySelector('.chip.page');
+    var toastText = sr.querySelector('#toast').textContent;
+    out.push('   chip  = ' + JSON.stringify(chip ? chip.textContent : null));
+    out.push('   toast = ' + JSON.stringify(toastText));
+    if (!chip || chip.textContent.indexOf('可见区：') !== 0) { throw new Error('chip 没切到可见区'); }
+    if (chip.textContent.indexOf('被读的那个页面') < 0) { throw new Error('又读成侧栏自己了'); }
+    if (toastText.indexOf('6 字') < 0) { throw new Error('可见区字数不是标签页 visible 的 6 字'); }
+  });
+
+  sr.querySelector('#page').click();          // 可见区 → 关
+  await wait(80);
+  t('第三下 → 关掉，按钮文字复位', function () {
+    var btn = sr.querySelector('#page');
+    out.push('   按钮文字 = ' + JSON.stringify(btn.textContent) +
+             '  chip = ' + !!sr.querySelector('.chip.page'));
+    if (sr.querySelector('.chip.page')) { throw new Error('chip 没清掉'); }
+    if (btn.textContent !== '应用网页') { throw new Error('按钮文字没复位'); }
+  });
+
+  var d = document.getElementById('report');
+  // 面板是铺满视口的浮层，报告得排在它**后面**才盖得住（同 z-index 时看 DOM 顺序）
+  document.body.appendChild(d);
+  d.style.position = 'relative';
+  d.style.zIndex = '2147483647';
+  d.style.background = bad ? '#dc2626' : '#0F6E56';
+  d.textContent = (bad ? '★ 有 ' + bad + ' 项没过' : '侧边栏自检：全部通过 ✓') + '\n' + out.join('\n');
+}, 700);
+</script>
+</body>
+</html>

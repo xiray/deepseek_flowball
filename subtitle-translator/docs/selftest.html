@@ -1,0 +1,837 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>字幕翻译扩展 · 自检</title>
+<style>
+  body { margin:0; padding:22px; background:#f4f4f1; color:#23231f;
+         font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; font-size:13px; }
+  h1 { font-size:17px; margin:0 0 4px; }
+  .lead { color:#6b6a63; margin:0 0 18px; font-size:12px; }
+  .rep { border:1px solid #dcdad3; border-radius:10px; padding:14px 16px; margin-bottom:14px; background:#fff; }
+  .rep h3 { font-size:13px; margin:0 0 9px; font-family: ui-monospace, Consolas, monospace; }
+  .row { font-family: ui-monospace, Consolas, monospace; font-size:12px;
+         padding:3px 8px; border-radius:5px; margin-bottom:3px; white-space:pre-wrap; word-break:break-word; }
+  .row.pass { background:#eaf3de; color:#27500a; }
+  .row.fail { background:#fcebeb; color:#791f1f; font-weight:600; }
+  #summary { position:sticky; top:0; z-index:9; padding:11px 16px; border-radius:10px;
+             margin-bottom:16px; font-size:14px; font-weight:600; }
+  #summary.good { background:#eaf3de; color:#27500a; border:1px solid #97c459; }
+  #summary.bad  { background:#fcebeb; color:#791f1f; border:1px solid #f09595; }
+  #stage { position:fixed; right:16px; bottom:16px; background:#26215c; color:#cecbf6;
+           padding:6px 12px; border-radius:8px; font-family: ui-monospace, monospace; font-size:11px; }
+</style>
+</head>
+<body>
+
+<h1>字幕实时翻译 · 离线自检</h1>
+<p class="lead">直接加载扩展的真实源码文件，只把浏览器 API 换成桩。新增断言先跑一遍看它是红的，再改代码。</p>
+
+<div id="summary">running…</div>
+<div id="repA" data-title="A. 字幕解析层（parse.js）"></div>
+<div id="repB" data-title="B. 后台 service worker（background.js）"></div>
+<div id="repC" data-title="C. 覆盖层（overlay.js）"></div>
+<div id="repD" data-title="D. 翻译流水线（pipeline.js）"></div>
+<div id="repE" data-title="E. L1 网络抓取（capture.js）"></div>
+<div id="repF" data-title="F. 端到端：抓取 → 翻译 → 渲染（main.js）"></div>
+<div id="repG" data-title="G. 界面与清单契约"></div>
+<div id="repH" data-title="H. 设置页 / 弹窗真的跑起来（用真实 markup + 真实 js）"></div>
+<div id="stage">boot</div>
+
+<script>
+/* ===================== 桩 ===================== */
+var __stage = document.getElementById('stage');
+function stage(s) { __stage.textContent = s; }
+
+var __store = {
+  enabled: false,
+  apiKey: '',
+  baseUrl: 'https://api.deepseek.com',
+  model: 'deepseek-flash',
+  targetLang: '简体中文',
+  prefetchAhead: 45,
+  batchSize: 8,
+  concurrency: 2,
+  showMode: 'zh',
+  autoEnableTracks: true,
+  domFallback: false,
+  fontScale: 1,
+  debug: true
+};
+var __sent = [];
+var __changeListeners = [];
+var __msgListeners = [];
+var __installedListeners = [];
+var __connectListeners = [];
+var __ports = [];
+var __badge = [];
+var __openedOptions = 0;
+var __tabsSent = [];
+var __reply = function () { return { ok: true }; };
+
+function clone(o) { return JSON.parse(JSON.stringify(o)); }
+
+window.chrome = {
+  storage: {
+    local: {
+      /* 真实 API 两种调用方式都支持：给回调就用回调，不给回调返回 Promise。
+         只实现回调式会让任何用 Promise 写法的源码在自检里假失败。 */
+      get: function (keys, cb) {
+        var p = new Promise(function (res) {
+          setTimeout(function () { res(clone(__store)); }, 0);
+        });
+        if (typeof cb === 'function') { p.then(cb); return; }
+        return p;
+      },
+      set: function (o, cb) {
+        var p = new Promise(function (res) {
+          setTimeout(function () {
+            var changes = {};
+            Object.keys(o).forEach(function (k) {
+              changes[k] = { oldValue: __store[k], newValue: o[k] };
+              __store[k] = o[k];
+            });
+            __changeListeners.forEach(function (fn) { try { fn(changes, 'local'); } catch (e) {} });
+            res();
+          }, 0);
+        });
+        if (typeof cb === 'function') { p.then(function () { cb(); }); return; }
+        return p;
+      }
+    },
+    onChanged: { addListener: function (fn) { __changeListeners.push(fn); } }
+  },
+  runtime: {
+    id: 'selftest',
+    lastError: null,
+    getManifest: function () { return { version: '1.0.0-test' }; },
+    sendMessage: function (msg, cb) {
+      __sent.push(msg);
+      setTimeout(function () { if (cb) cb(__reply(msg)); }, 0);
+    },
+    connect: function (info) {
+      var port = {
+        name: info && info.name,
+        postMessage: function () {},
+        onDisconnect: { addListener: function () {} },
+        onMessage: { addListener: function () {} }
+      };
+      __ports.push(port);
+      return port;
+    },
+    onMessage: { addListener: function (fn) { __msgListeners.push(fn); } },
+    onInstalled: { addListener: function (fn) { __installedListeners.push(fn); } },
+    onConnect: { addListener: function (fn) { __connectListeners.push(fn); } },
+    openOptionsPage: function () { __openedOptions++; }
+  },
+  action: {
+    setBadgeText: function (o) { __badge.push(o.text); },
+    setBadgeBackgroundColor: function () {}
+  },
+  /* popup.js 会向当前标签页要状态。桩里没有 tabs，它在 refresh() 第一次调用就崩，
+     而崩在异步回调里的错很容易被忽略成"popup 就是没反应"。 */
+  tabs: {
+    query: function (q, cb) { setTimeout(function () { cb([{ id: 1 }]); }, 0); },
+    sendMessage: function (tabId, msg, cb) {
+      __tabsSent.push(msg);
+      setTimeout(function () { if (cb) cb(null); }, 0);
+    }
+  }
+};
+
+window.importScripts = function () {};
+
+window.addEventListener('error', function (e) {
+  var box = document.getElementById('summary');
+  box.className = 'bad';
+  box.textContent = '脚本异常：' + (e.message || e.error);
+});
+var __realError = console.error;
+console.error = function () {
+  var box = document.getElementById('summary');
+  if (!/^PASS/.test(box.textContent || '')) {
+    box.className = 'bad';
+    box.textContent = 'console.error：' + Array.prototype.join.call(arguments, ' ');
+  }
+  __realError.apply(console, arguments);
+};
+
+function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+var TOTAL = 0, FAILED = 0;
+function mkReport(id) {
+  var box = document.getElementById(id);
+  var h = document.createElement('h3');
+  h.textContent = box.getAttribute('data-title');
+  box.appendChild(h);
+  var list = document.createElement('div');
+  box.appendChild(list);
+  return function (name, pass, detail) {
+    TOTAL++;
+    if (!pass) FAILED++;
+    var row = document.createElement('div');
+    row.className = 'row ' + (pass ? 'pass' : 'fail');
+    row.textContent = (pass ? 'PASS  ' : 'FAIL  ') + name + (detail === undefined ? '' : '   → ' + detail);
+    list.appendChild(row);
+    if (!pass) console.log('FAIL:', name, detail);
+    return pass;
+  };
+}
+function J(v) { try { return JSON.stringify(v); } catch (e) { return String(v); } }
+function showRaw(box) { box.textContent = String(box.textContent || '').slice(0, 200); }
+</script>
+
+<script src="../shared/settings.js"></script>
+<script src="../content/parse.js"></script>
+<script src="../content/overlay.js"></script>
+<script src="../content/pipeline.js"></script>
+<script src="../content/capture.js"></script>
+<script src="../background.js"></script>
+
+<script>
+(async function () {
+
+  /* ===================== A. 解析层 ===================== */
+  stage('A 解析层');
+  var A = mkReport('repA');
+
+  A('时间码 01:02:03.500 → 3723.5', Math.abs(DS_PARSE.parseTimecode('01:02:03.500') - 3723.5) < 0.001,
+    DS_PARSE.parseTimecode('01:02:03.500'));
+  A('时间码 250ms → 0.25', Math.abs(DS_PARSE.parseTimecode('250ms') - 0.25) < 0.001,
+    DS_PARSE.parseTimecode('250ms'));
+  A('时间码 00:00:02,500（SRT 逗号）→ 2.5', Math.abs(DS_PARSE.parseTimecode('00:00:02,500') - 2.5) < 0.001,
+    DS_PARSE.parseTimecode('00:00:02,500'));
+  A('时间码 01:02:03:12（含帧）不返回 NaN', isFinite(DS_PARSE.parseTimecode('01:02:03:12')),
+    DS_PARSE.parseTimecode('01:02:03:12'));
+
+  var vtt = '\uFEFFWEBVTT\nKind: captions\n\nNOTE 这是注释\n\ncue1\n' +
+    '00:00:01.000 --> 00:00:03.000 align:start position:0%\n' +
+    '<v Bob>Hello <c.yellow>world</c></v>\n\n' +
+    '00:00:03.000 --> 00:00:05.000\nSecond &amp; third\n';
+  var rVtt = DS_PARSE.parseSubtitle(vtt, 'x.vtt');
+  A('VTT 解析出 2 条', rVtt.cues.length === 2, rVtt.cues.length);
+  A('VTT 起始时间正确', rVtt.cues[0] && rVtt.cues[0].start === 1, rVtt.cues[0] && rVtt.cues[0].start);
+  A('VTT 去掉了 <v>/<c> 标签', rVtt.cues[0] && rVtt.cues[0].text === 'Hello world', rVtt.cues[0] && rVtt.cues[0].text);
+  A('VTT 实体还原 &amp; → &', rVtt.cues[1] && rVtt.cues[1].text === 'Second & third', rVtt.cues[1] && rVtt.cues[1].text);
+  A('NOTE 块没被当成字幕', !rVtt.cues.some(function (c) { return /这是注释/.test(c.text); }));
+
+  var srt = '1\r\n00:00:01,000 --> 00:00:02,500\r\nHello there\r\n\r\n' +
+    '2\r\n00:00:02,500 --> 00:00:04,000\r\nGeneral Kenobi\r\n';
+  var rSrt = DS_PARSE.parseSubtitle(srt, 'x.srt');
+  A('SRT（CRLF + 序号）解析出 2 条', rSrt.cues.length === 2, rSrt.cues.length);
+  A('SRT 首句文本正确', rSrt.cues[0] && rSrt.cues[0].text === 'Hello there', rSrt.cues[0] && rSrt.cues[0].text);
+
+  var ttml = '<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml"><body><div>' +
+    '<p begin="00:00:01.000" end="00:00:03.000">First <span>line</span></p>' +
+    '<p begin="4s" dur="2s">Second line</p>' +
+    '</div></body></tt>';
+  var rTtml = DS_PARSE.parseSubtitle(ttml, 'x.ttml');
+  A('TTML 解析出 2 条', rTtml.cues.length === 2, rTtml.cues.length);
+  A('TTML begin/dur 都对', rTtml.cues[1] && Math.abs(rTtml.cues[1].start - 4) < 0.001 && Math.abs(rTtml.cues[1].end - 6) < 0.001,
+    rTtml.cues[1] && (rTtml.cues[1].start + '~' + rTtml.cues[1].end));
+
+  var j3 = JSON.stringify({ events: [
+    { tStartMs: 1000, dDurationMs: 2000, segs: [{ utf8: 'Hello ' }, { utf8: 'world' }] },
+    { tStartMs: 3000, dDurationMs: 1500, segs: [{ utf8: 'Bye' }] }
+  ] });
+  var rJ3 = DS_PARSE.parseSubtitle(j3, 'timedtext?fmt=json3');
+  A('YouTube json3 解析出 2 条', rJ3.cues.length === 2, rJ3.cues.length);
+  A('json3 ms 换算成秒', rJ3.cues[1] && rJ3.cues[1].start === 3, rJ3.cues[1] && rJ3.cues[1].start);
+  A('json3 拼接 segs', rJ3.cues[0] && rJ3.cues[0].text === 'Hello world', rJ3.cues[0] && rJ3.cues[0].text);
+
+  var jg = JSON.stringify({ body: [
+    { from: 0.5, to: 2.5, content: '通用形状一' },
+    { from: 3, to: 4, content: '通用形状二' }
+  ] });
+  var rJg = DS_PARSE.parseSubtitle(jg, 'subtitle.json');
+  A('通用 JSON（from/to/content）解析出 2 条', rJg.cues.length === 2, rJg.cues.length);
+
+  var jBad = JSON.stringify({ list: [{ name: 'a', price: 3 }, { name: 'b', price: 4 }] });
+  var rBad = DS_PARSE.parseSubtitle(jBad, 'products.json');
+  A('无时间字段的 JSON 不产出字幕', rBad.cues.length === 0, rBad.cues.length);
+
+  var prose = 'This is just a paragraph of English text someone pasted into a file.\n' +
+    'It has no timings at all, so it must never be treated as subtitles.\n';
+  A('普通文本不产出字幕', DS_PARSE.parseSubtitle(prose, 'notes.txt').cues.length === 0);
+
+  var noEnd = DS_PARSE.normalizeCues([
+    { start: 1, end: NaN, text: 'A' },
+    { start: 4, end: 6, text: 'B' }
+  ]);
+  A('缺失 end 用下一条 start 补', noEnd[0].end === 4, noEnd[0].end);
+
+  var dup = DS_PARSE.normalizeCues([
+    { start: 1, end: 2, text: 'Same' },
+    { start: 2.1, end: 3, text: 'Same' },
+    { start: 5, end: 6, text: 'Other' }
+  ]);
+  A('紧邻重复行合并（滚动字幕）', dup.length === 2 && dup[0].end === 3, dup.length + ' 条');
+
+  var ordered = DS_PARSE.normalizeCues([
+    { start: 5, end: 6, text: 'later' },
+    { start: 1, end: 2, text: 'earlier' }
+  ]);
+  A('按时间排序', ordered[0].text === 'earlier', ordered[0].text);
+
+  var cl = [{ start: 1, end: 3, text: 'one' }, { start: 3, end: 5, text: 'two' }];
+  A('cueAt(1.2) 命中第一条', DS_PARSE.cueAt(cl, 1.2) === cl[0]);
+  A('cueAt(4) 命中第二条', DS_PARSE.cueAt(cl, 4) === cl[1]);
+  A('cueAt(99) 返回 null', DS_PARSE.cueAt(cl, 99) === null);
+
+  /* ===================== C. 覆盖层 ===================== */
+  stage('C 覆盖层');
+  var C = mkReport('repC');
+
+  var v1 = document.createElement('video');
+  v1.style.cssText = 'position:fixed;left:24px;top:24px;width:640px;height:360px;background:#000';
+  document.body.appendChild(v1);
+  await wait(60);
+
+  DS_OVERLAY.attach(v1);
+  DS_OVERLAY.setOptions({ showMode: 'both' });
+  DS_OVERLAY.show('这是中文字幕', 'This is English');
+  await wait(80);
+
+  var host = document.getElementById('__dssub_overlay_host__');
+  C('宿主节点已注入', !!host);
+  var sr = host && host.shadowRoot;
+  C('Shadow DOM 已建立', !!sr);
+  var wrap = sr && sr.querySelector('.wrap');
+  var zh = sr && sr.querySelector('.zh');
+  var en = sr && sr.querySelector('.en');
+  C('.zh 内容已写入', !!zh && zh.textContent === '这是中文字幕', zh && zh.textContent);
+  C('.en 内容已写入', !!en && en.textContent === 'This is English', en && en.textContent);
+  C('.wrap 带上了 on（可见）', !!wrap && wrap.classList.contains('on'));
+
+  var r1 = v1.getBoundingClientRect();
+  var tr = wrap && wrap.style.transform;
+  var mx = tr && tr.match(/translate\((-?\d+)px,\s*(-?\d+)px\)/);
+  C('横向对齐到视频左边缘', !!mx && Math.abs(parseInt(mx[1], 10) - r1.left) <= 2, tr);
+  C('纵向锚点在视频底部内侧', !!mx && Math.abs(parseInt(mx[2], 10) - (r1.top + r1.height * 0.945)) <= 24, tr);
+  C('宽度跟视频一致', !!wrap && Math.abs(parseFloat(wrap.style.width) - r1.width) <= 2, wrap && wrap.style.width);
+
+  var zhRect = zh.getBoundingClientRect();
+  var hit = document.elementFromPoint(zhRect.left + zhRect.width / 2, zhRect.top + zhRect.height / 2);
+  C('字幕可以点穿（不挡播放器）', hit === v1, hit && (hit.tagName + (hit.id ? '#' + hit.id : '')));
+
+  C('双语模式两行都显示', !zh.classList.contains('hide') && !en.classList.contains('hide'));
+
+  DS_OVERLAY.setOptions({ showMode: 'zh' });
+  await wait(30);
+  C('仅中文模式隐藏英文行', en.classList.contains('hide'));
+  C('仅中文模式中文行仍在', !zh.classList.contains('hide') && zh.textContent === '这是中文字幕');
+
+  DS_OVERLAY.setOptions({ showMode: 'both' });
+  await wait(30);
+
+  DS_OVERLAY.hide();
+  await wait(30);
+  C('hide() 后不可见', !wrap.classList.contains('on'));
+
+  DS_OVERLAY.detach();
+  C('detach() 移除宿主', !document.getElementById('__dssub_overlay_host__'));
+  v1.parentNode.removeChild(v1);
+
+  /* ===================== D. 流水线 ===================== */
+  stage('D 流水线');
+  var D = mkReport('repD');
+  DS_PIPELINE.reset();
+  DS_PIPELINE.setOptions({ concurrency: 2 });
+
+  __sent.length = 0;
+  __reply = function (msg) {
+    if (msg.type !== 'ds-translate') return { ok: true };
+    return {
+      ok: true,
+      matched: msg.lines.length,
+      elapsedMs: 11,
+      results: msg.lines.map(function (t, i) { return '译' + (i + 1); })
+    };
+  };
+
+  var cuesD = [
+    { start: 0, end: 2, text: 'Alpha', zh: '', state: 'idle', tries: 0 },
+    { start: 2, end: 4, text: 'Beta', zh: '', state: 'idle', tries: 0 }
+  ];
+  var gotD = await new Promise(function (res) { DS_PIPELINE.submit(cuesD, function (e, r) { res({ e: e, r: r }); }); });
+  D('一次请求覆盖整批', __sent.length === 1 && __sent[0].lines.length === 2, J(__sent.map(function (m) { return m.lines; })));
+  D('结果按序号对齐回原句', gotD.r && gotD.r[0] === '译1' && gotD.r[1] === '译2', J(gotD.r));
+
+  __sent.length = 0;
+  var gotHit = await new Promise(function (res) { DS_PIPELINE.submit(cuesD, function (e, r) { res(r); }); });
+  D('命中缓存后不再发请求', __sent.length === 0, __sent.length);
+  D('缓存命中也能返回同样译文', gotHit[0] === '译1' && gotHit[1] === '译2', J(gotHit));
+
+  __sent.length = 0;
+  var mixed = [
+    { text: 'Alpha' },
+    { text: 'Brand New' }
+  ];
+  var gotMix = await new Promise(function (res) { DS_PIPELINE.submit(mixed, function (e, r) { res(r); }); });
+  D('只把未命中的那句发出去', __sent.length === 1 && __sent[0].lines.length === 1 && __sent[0].lines[0] === 'Brand New',
+    J(__sent.map(function (m) { return m.lines; })));
+  D('混合批次结果位置正确', gotMix[0] === '译1' && gotMix[1] === '译1', J(gotMix));
+
+  __reply = function () { return { ok: false, error: '模拟 429' }; };
+  var beforeFail = DS_PIPELINE.snapshot().fail;
+  await new Promise(function (res) {
+    DS_PIPELINE.submit([{ text: 'Will Fail' }], function () { res(); });
+  });
+  var snapFail = DS_PIPELINE.snapshot();
+  D('失败被记入统计', snapFail.fail === beforeFail + 1, snapFail.fail);
+  D('失败后进入退避，暂停发车', DS_PIPELINE.canSend() === false, 'backoff=' + snapFail.backoffMs + 'ms');
+  D('错误信息被保留', /429/.test(snapFail.lastError), snapFail.lastError);
+
+  __reply = function (msg) {
+    if (msg.type !== 'ds-translate') return { ok: true };
+    return { ok: true, results: msg.lines.map(function (t) { return 'OK:' + t; }) };
+  };
+  DS_PIPELINE.reset();
+  var gateOk = [];
+  for (var gi = 0; gi < 4; gi++) {
+    gateOk.push(DS_PIPELINE.canSend());
+    DS_PIPELINE.submit([{ text: 'gate' + gi }], function () {});
+  }
+  D('并发闸门生效（最多 2 个在飞）', gateOk.filter(Boolean).length === 2, J(gateOk));
+  await wait(120);
+
+  /* ===================== E. L1 抓取 ===================== */
+  stage('E 网络抓取');
+  var E = mkReport('repE');
+  var cap = [];
+  window.addEventListener('message', function (ev) {
+    if (ev.data && ev.data.__dssub === '__dssub_capture_v1' && ev.data.data) cap.push(ev.data.data);
+  });
+  await wait(40);
+
+  function getText(url) {
+    return fetch(url).then(function (r) { return r.text(); }).catch(function (e) { return 'FETCH-ERR:' + e; });
+  }
+
+  await getText('sample.vtt');
+  await wait(150);
+  E('fetch 到 .vtt 被拦截', cap.length === 1, cap.length + ' 条');
+  E('抓到的是 vtt 原文', cap[0] && cap[0].body.indexOf('WEBVTT') === 0, cap[0] && cap[0].body.slice(0, 24));
+  E('带上了来源 URL', cap[0] && /sample\.vtt$/.test(cap[0].url), cap[0] && cap[0].url);
+
+  var b2 = cap.length;
+  var fakeBody = await getText('fake.vtt');
+  await wait(150);
+  E('URL 像字幕但内容是 JSON → 拒绝', cap.length === b2,
+    '内容 ' + String(fakeBody).slice(0, 24) + ' / 捕获 ' + cap.length);
+
+  var b3 = cap.length;
+  await getText('payload.json');
+  await wait(150);
+  E('普通接口请求不被误抓', cap.length === b3, cap.length + ' vs ' + b3);
+
+  var xhrInfo = { fired: false, status: 0, err: null };
+  await new Promise(function (res) {
+    var x = new XMLHttpRequest();
+    x.open('GET', 'sample2.vtt');
+    x.addEventListener('load', function () {
+      xhrInfo.fired = true; xhrInfo.status = x.status;
+      setTimeout(res, 120);
+    });
+    x.addEventListener('error', function () { xhrInfo.err = 'error event'; setTimeout(res, 120); });
+    try { x.send(); } catch (e) { xhrInfo.err = String(e); res(); }
+  });
+  await wait(150);
+  E('XHR 请求本身成功', xhrInfo.fired && xhrInfo.status === 200, J(xhrInfo));
+  E('XHR 路径也抓得到', cap.length === b3 + 1, cap.length + ' vs ' + (b3 + 1));
+  E('XHR 抓到的是第二份文件', cap[cap.length - 1] && /Loaded through XMLHttpRequest/.test(cap[cap.length - 1].body),
+    cap[cap.length - 1] && cap[cap.length - 1].body.slice(-30));
+
+  var b4 = cap.length;
+  await getText('sample.vtt');
+  await wait(150);
+  E('同一份字幕重复请求不重复上报', cap.length === b4, cap.length + ' vs ' + b4);
+
+  /* ===================== B. service worker ===================== */
+  stage('B 后台');
+  var B = mkReport('repB');
+
+  var realFetch = window.fetch;
+  var apiCalls = [];
+  window.fetch = function (url, init) {
+    apiCalls.push({ url: String(url), init: init || {}, body: init && init.body ? JSON.parse(init.body) : null });
+    return Promise.resolve({
+      ok: true,
+      status: 200,
+      text: function () {
+        return Promise.resolve(JSON.stringify({
+          model: 'deepseek-flash',
+          choices: [{ message: { content: '1|你好，你好吗？\n2|这是一个测试。\n3|明天见。' } }],
+          usage: { prompt_tokens: 40, completion_tokens: 20 }
+        }));
+      }
+    });
+  };
+
+  __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
+  var bgListener = __msgListeners[0];
+  B('background 注册了消息监听', typeof bgListener === 'function', typeof bgListener);
+
+  var testResp = await new Promise(function (res) {
+    bgListener({ type: 'ds-test' }, {}, res);
+  });
+  B('测试连接返回成功', testResp && testResp.ok === true, J(testResp && testResp.error));
+  B('提示词行数对齐解析正确', testResp && testResp.matched === 3, testResp && testResp.matched);
+
+  var call = apiCalls[apiCalls.length - 1];
+  B('请求打到 /chat/completions', !!call && /\/chat\/completions$/.test(call.url), call && call.url);
+  B('带上了 Bearer 凭证', !!call && call.init.headers && call.init.headers.Authorization === 'Bearer sk-sample0123456789abcdefWXYZ',
+    call && call.init.headers && call.init.headers.Authorization);
+  B('模型是 deepseek-flash', !!call && call.body.model === 'deepseek-flash', call && call.body.model);
+  B('关了 thinking（关键）', !!call && call.body.thinking && call.body.thinking.type === 'disabled',
+    call && J(call.body.thinking));
+  B('不是流式（service worker 里好处理）', !!call && call.body.stream === false, call && J(call.body.stream));
+
+  apiCalls.length = 0;
+  var tr = await new Promise(function (res) {
+    bgListener({ type: 'ds-translate', lines: ['Hello', 'World'] }, {}, res);
+  });
+  B('批量翻译返回 2 条', tr && tr.ok && tr.results.length === 2, J(tr && tr.results));
+  var up = apiCalls[apiCalls.length - 1].body.messages[1].content;
+  B('用户消息按「序号|」编号', up === '1|Hello\n2|World', J(up));
+  B('系统提示要求行数一致', /输出行数必须与输入完全一致/.test(apiCalls[apiCalls.length - 1].body.messages[0].content));
+
+  window.fetch = function () {
+    return Promise.resolve({
+      ok: false, status: 401,
+      text: function () { return Promise.resolve(JSON.stringify({ error: { message: 'Authentication Fails' } })); }
+    });
+  };
+  var e401 = await new Promise(function (res) { bgListener({ type: 'ds-translate', lines: ['x'] }, {}, res); });
+  B('401 转成人话', e401 && !e401.ok && /API Key 无效/.test(e401.error), e401 && e401.error);
+
+  window.fetch = function () {
+    return Promise.resolve({
+      ok: false, status: 402,
+      text: function () { return Promise.resolve(JSON.stringify({ error: { message: 'Insufficient Balance' } })); }
+    });
+  };
+  var e402 = await new Promise(function (res) { bgListener({ type: 'ds-translate', lines: ['x'] }, {}, res); });
+  B('402 转成人话', e402 && !e402.ok && /余额不足/.test(e402.error), e402 && e402.error);
+
+  window.fetch = function () {
+    return Promise.resolve({
+      ok: true, status: 200,
+      text: function () { return Promise.resolve('这不是 JSON'); }
+    });
+  };
+  var eBad = await new Promise(function (res) { bgListener({ type: 'ds-translate', lines: ['x'] }, {}, res); });
+  B('非 JSON 返回不崩，报可读错误', eBad && !eBad.ok, eBad && eBad.error);
+
+  window.fetch = function () {
+    return Promise.resolve({
+      ok: true, status: 200,
+      text: function () { return Promise.resolve(JSON.stringify({ choices: [{ message: { content: '我拒绝按格式输出' } }] })); }
+    });
+  };
+  var eFmt = await new Promise(function (res) { bgListener({ type: 'ds-translate', lines: ['x', 'y'] }, {}, res); });
+  B('模型不按格式输出时能被识别', eFmt && !eFmt.ok && /无法解析/.test(eFmt.error), eFmt && eFmt.error);
+
+  window.fetch = realFetch;
+
+  __openedOptions = 0;
+  __store.apiKey = '';
+  __installedListeners.forEach(function (fn) { fn({ reason: 'install' }); });
+  await wait(60);
+  B('首次安装且没 Key → 自动打开设置页', __openedOptions === 1, __openedOptions);
+  B('没 Key 时打上角标提示', __badge.indexOf('!') >= 0, J(__badge));
+
+  __openedOptions = 0;
+  __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
+  __installedListeners.forEach(function (fn) { fn({ reason: 'install' }); });
+  await wait(60);
+  B('已配 Key → 不再打扰', __openedOptions === 0, __openedOptions);
+
+  /* ===================== F. 端到端 ===================== */
+  stage('F 端到端：载入 main.js');
+  var F = mkReport('repF');
+
+  var v2 = document.createElement('video');
+  v2.style.cssText = 'position:fixed;left:40px;top:40px;width:600px;height:340px;background:#111';
+  document.body.appendChild(v2);
+  var fakeTime = 1.2;
+  Object.defineProperty(v2, 'currentTime', { get: function () { return fakeTime; }, configurable: true });
+  Object.defineProperty(v2, 'paused', { get: function () { return false; }, configurable: true });
+
+  var sentF = [];
+  __reply = function (msg) {
+    if (msg.type !== 'ds-translate') return { ok: true };
+    sentF.push(msg.lines.slice());
+    return {
+      ok: true, matched: msg.lines.length, elapsedMs: 9,
+      results: msg.lines.map(function (t) { return '【' + t + '】'; })
+    };
+  };
+
+  await new Promise(function (res) {
+    var s = document.createElement('script');
+    s.src = '../content/main.js';
+    s.onload = function () { setTimeout(res, 120); };
+    s.onerror = function () { res(); };
+    document.head.appendChild(s);
+  });
+  F('main.js 加载成功', typeof window.__dssub_main_installed === 'boolean', window.__dssub_main_installed);
+
+  await wait(700);
+  F('锁定了页面里的视频', DS_OVERLAY.getTarget() === v2,
+    DS_OVERLAY.getTarget() ? 'ok' : 'null');
+
+  var epVtt = 'WEBVTT\n\n00:00:00.500 --> 00:00:02.500\nHello world\n\n' +
+    '00:00:02.500 --> 00:00:04.500\nSecond line\n\n' +
+    '00:00:04.500 --> 00:00:06.500\nThird line\n';
+  window.postMessage({ __dssub: '__dssub_capture_v1', data: { url: 'https://host/ep.vtt', body: epVtt } }, '*');
+
+  __store.enabled = true;
+  __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
+  __store.prefetchAhead = 45;
+  __changeListeners.forEach(function (fn) {
+    fn({ enabled: { newValue: true }, apiKey: { newValue: __store.apiKey } }, 'local');
+  });
+
+  await wait(900);
+  var stF = await new Promise(function (res) {
+    var l = __msgListeners[__msgListeners.length - 1];
+    l({ type: 'ds-status' }, {}, res);
+  });
+  F('状态回报：识别到视频', stF && stF.hasVideo === true, J(stF && { v: stF.hasVideo }));
+  F('状态回报：字幕源是「字幕文件」', stF && stF.kind === 'file', stF && stF.kind);
+  F('状态回报：解析出 3 条', stF && stF.total === 3, stF && stF.total);
+  F('确实把 3 条发去翻译了', sentF.length >= 1 && sentF[0].length === 3, J(sentF[0]));
+  F('只发了当前时间之后、预取窗口内的内容', sentF[0] && sentF[0][0] === 'Hello world', sentF[0] && sentF[0][0]);
+
+  await wait(700);
+  var stF2 = await new Promise(function (res) {
+    var l = __msgListeners[__msgListeners.length - 1];
+    l({ type: 'ds-status' }, {}, res);
+  });
+  F('译文已回填', stF2 && stF2.done >= 1, stF2 && (stF2.done + '/' + stF2.total));
+
+  var host2 = document.getElementById('__dssub_overlay_host__');
+  var zh2 = host2 && host2.shadowRoot && host2.shadowRoot.querySelector('.zh');
+  F('覆盖层显示了中文', !!zh2 && zh2.textContent === '【Hello world】', zh2 && zh2.textContent);
+
+  fakeTime = 99;
+  await wait(500);
+  var wrap2 = host2 && host2.shadowRoot && host2.shadowRoot.querySelector('.wrap');
+  F('播过字幕区间后自动隐藏', !!wrap2 && !wrap2.classList.contains('on'));
+
+  if (v2.parentNode) v2.parentNode.removeChild(v2);
+
+  /* ===================== G. 界面契约 ===================== */
+  stage('G 界面契约');
+  var G = mkReport('repG');
+
+  function pull(url) {
+    return fetch(url).then(function (r) { return r.text(); }).catch(function () { return ''; });
+  }
+  function idsIn(html) {
+    var out = {}, m;
+    var re = /id="([^"]+)"/g;
+    while ((m = re.exec(html))) out[m[1]] = 1;
+    return out;
+  }
+  function refsIn(js) {
+    var out = {}, m;
+    var res = [/\$\('([A-Za-z0-9_-]+)'\)/g, /getElementById\('([^']+)'\)/g];
+    for (var r = 0; r < res.length; r++) {
+      while ((m = res[r].exec(js))) out[m[1]] = 1;
+    }
+    return Object.keys(out);
+  }
+
+  var files = {};
+  var names = ['options.html', 'options.js', 'popup.html', 'popup.js',
+    'background.js', 'shared/settings.js', 'content/parse.js',
+    'content/overlay.js', 'content/pipeline.js', 'content/main.js', 'content/capture.js'];
+  for (var fi = 0; fi < names.length; fi++) {
+    files[names[fi]] = await pull('../' + names[fi]);
+  }
+  G('所有源文件都能读到', names.every(function (n) { return files[n].length > 50; }),
+    names.filter(function (n) { return files[n].length <= 50; }).join(',') || 'ok');
+
+  var optIds = idsIn(files['options.html']);
+  var missingOpt = refsIn(files['options.js']).filter(function (id) { return !optIds[id]; });
+  G('options.js 引用的 id 在 options.html 里都存在', missingOpt.length === 0, J(missingOpt));
+
+  var popIds = idsIn(files['popup.html']);
+  var missingPop = refsIn(files['popup.js']).filter(function (id) { return !popIds[id]; });
+  G('popup.js 引用的 id 在 popup.html 里都存在', missingPop.length === 0, J(missingPop));
+
+  G('options 页面有 API Key 输入框（password 类型）',
+    /<input[^>]*id="apiKey"[^>]*type="password"/.test(files['options.html'].replace(/\n/g, ' ')));
+  G('popup 页面也有 API Key 输入框',
+    /<input[^>]*id="apiKey"/.test(files['popup.html'].replace(/\n/g, ' ')));
+  G('两个页面都加载了 shared/settings.js（默认值只有一份）',
+    /src="shared\/settings\.js"/.test(files['options.html']) &&
+    /src="shared\/settings\.js"/.test(files['popup.html']),
+    'options:' + /src="shared\/settings\.js"/.test(files['options.html']) +
+    ' popup:' + /src="shared\/settings\.js"/.test(files['popup.html']));
+
+  var keyPattern = /[s]k-[A-Za-z0-9_-]{16,}/;
+  var leaked = names.filter(function (n) { return keyPattern.test(files[n]); });
+  G('源码里没有明文 API Key', leaked.length === 0, leaked.join(',') || '干净');
+
+  var manifest = await pull('../manifest.json');
+  var mf = null;
+  try { mf = JSON.parse(manifest); } catch (e) {}
+  G('manifest 能被解析', !!mf);
+  G('manifest 版本号正常', !!mf && /^\d+\.\d+\.\d+$/.test(mf.version), mf && mf.version);
+  G('manifest 声明了 deepseek 的 host 权限',
+    !!mf && JSON.stringify(mf.host_permissions || []).indexOf('api.deepseek.com') >= 0,
+    mf && J(mf.host_permissions));
+  G('MAIN world 抓取脚本已声明', !!mf && /world/.test(manifest) && /"MAIN"/.test(manifest));
+  G('声明了 storage 权限', !!mf && (mf.permissions || []).indexOf('storage') >= 0, mf && J(mf.permissions));
+
+  /* ===================== H. 设置页 / 弹窗真的跑起来 ===================== */
+  stage('H 设置页与弹窗');
+  var H = mkReport('repH');
+
+  function stripPage(html) {
+    return html.replace(/[\s\S]*<body>/i, '')
+      .replace(/<\/body>[\s\S]*/i, '')
+      .replace(/<script[\s\S]*?<\/script>/gi, '');
+  }
+  function loadScript(src) {
+    return new Promise(function (res) {
+      var s = document.createElement('script');
+      s.src = src;
+      s.onload = function () { setTimeout(res, 140); };
+      s.onerror = function () { res(); };
+      document.head.appendChild(s);
+    });
+  }
+  /* 注入真实页面时要一个一个来：options.html 和 popup.html 都有 id="apiKey"，
+     同时留在文档里的话 getElementById 只会拿到第一个，后面那个脚本就绑错元素了。 */
+  var optHolder = document.createElement('div');
+  optHolder.innerHTML = stripPage(files['options.html']);
+  document.body.appendChild(optHolder);
+
+  __store.apiKey = '';
+  __store.enabled = true;
+  __sent.length = 0;
+
+  await loadScript('../options.js');
+
+  var oKey = optHolder.querySelector('#apiKey');
+  var oToggle = optHolder.querySelector('#toggleKey');
+  var oSave = optHolder.querySelector('#saveBtn');
+  var oTest = optHolder.querySelector('#testBtn');
+  var oAuto = optHolder.querySelector('#autoEnableTracks');
+  var oDom = optHolder.querySelector('#domFallback');
+  var oModel = optHolder.querySelector('#model');
+  var oLang = optHolder.querySelector('#targetLang');
+  var oOut = optHolder.querySelector('#testOut');
+
+  H('设置页拿到了 Key 输入框和按钮',
+    !!(oKey && oToggle && oSave && oTest), 'key=' + !!oKey + ' save=' + !!oSave + ' test=' + !!oTest);
+  H('Key 输入框是 password 类型', !!oKey && oKey.type === 'password', oKey && oKey.type);
+  H('默认值真的被填进了界面（自动启用字幕轨应勾上）',
+    !!oAuto && oAuto.checked === true, oAuto && oAuto.checked);
+  H('默认关闭的项没被误勾（DOM 兜底）', !!oDom && oDom.checked === false, oDom && oDom.checked);
+  H('模型下拉填充且默认 deepseek-flash', !!oModel && oModel.value === 'deepseek-flash', oModel && oModel.value);
+  H('目标语言下拉默认简体中文', !!oLang && oLang.value === '简体中文', oLang && oLang.value);
+
+  oToggle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(40);
+  H('「显示」把 Key 框切成明文', oKey.type === 'text', oKey.type);
+  oToggle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(40);
+  H('再点一次切回密码框', oKey.type === 'password', oKey.type);
+
+  oKey.value = 'sk-sample0123456789abcdefWXYZ';
+  oSave.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(120);
+  H('点「保存设置」把 Key 写进了 storage',
+    __store.apiKey === 'sk-sample0123456789abcdefWXYZ', __store.apiKey);
+
+  __reply = function (msg) {
+    if (msg.type === 'ds-test') {
+      return {
+        ok: true, model: 'deepseek-flash', elapsedMs: 42, matched: 3,
+        sample: ['你好，你好吗？', '这是一个测试。', '明天见。']
+      };
+    }
+    return { ok: true };
+  };
+  __sent.length = 0;
+  oTest.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(200);
+  H('「测试连接」真的发出了 ds-test', __sent.some(function (m) { return m.type === 'ds-test'; }),
+    J(__sent.map(function (m) { return m.type; })));
+  H('测试成功的结果渲染到了页面上',
+    /通了/.test(oOut.textContent) && /42ms/.test(oOut.textContent), oOut.textContent.slice(0, 60));
+
+  __reply = function () { return { ok: false, error: 'API Key 无效或已过期（401）' }; };
+  oTest.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(200);
+  H('测试失败时把原因显示出来', /401/.test(oOut.textContent), oOut.textContent.slice(0, 60));
+  H('失败时错误卡片被展开', optHolder.querySelector('#errorCard').hidden === false);
+
+  optHolder.parentNode.removeChild(optHolder);
+
+  var popHolder = document.createElement('div');
+  popHolder.style.display = 'none';
+  popHolder.innerHTML = stripPage(files['popup.html']);
+  document.body.appendChild(popHolder);
+
+  __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
+  __store.enabled = true;
+  __sent.length = 0;
+
+  await loadScript('../popup.js');
+
+  var pKey = popHolder.querySelector('#apiKey');
+  var pSave = popHolder.querySelector('#saveKey');
+  var pEnabled = popHolder.querySelector('#enabled');
+  var pTip = popHolder.querySelector('#keyTip');
+  var pOpts = popHolder.querySelector('#openOpts');
+
+  H('弹窗里也有 Key 输入框', !!pKey);
+  H('弹窗把已存的 Key 回填进输入框',
+    !!pKey && pKey.value === 'sk-sample0123456789abcdefWXYZ', pKey && pKey.value);
+  H('弹窗的开关反映 enabled=true', !!pEnabled && pEnabled.checked === true, pEnabled && pEnabled.checked);
+  H('弹窗提示里 Key 是打码的，没有明文回显',
+    !!pTip && pTip.textContent.indexOf('sk-sample0123456789abcdefWXYZ') < 0, pTip && pTip.textContent);
+  H('弹窗有「更多设置」入口', !!pOpts);
+  H('弹窗向当前标签页要了状态', __tabsSent.some(function (m) { return m.type === 'ds-status'; }),
+    J(__tabsSent.map(function (m) { return m.type; })));
+
+  pKey.value = 'sk-second-0000111122223333';
+  pSave.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+  await wait(150);
+  H('弹窗保存改写了 storage 里的 Key',
+    __store.apiKey === 'sk-second-0000111122223333', __store.apiKey);
+
+  pEnabled.checked = false;
+  pEnabled.dispatchEvent(new Event('change', { bubbles: true }));
+  await wait(150);
+  H('弹窗关掉总开关写进了 storage', __store.enabled === false, __store.enabled);
+
+  /* 弹窗里挂了 setInterval 轮询状态，所以这个 holder 不能删——
+     删了之后轮询拿到 null 会抛异常，反过来把汇总条刷成"脚本异常"。 */
+
+  /* ===================== 汇总 ===================== */
+  stage('done');
+  var box = document.getElementById('summary');
+  box.className = FAILED ? 'bad' : 'good';
+  box.textContent = (FAILED ? 'FAILED  ' : 'ALL PASS  ') + (TOTAL - FAILED) + ' / ' + TOTAL +
+    (FAILED ? '（失败 ' + FAILED + ' 条）' : '');
+  document.title = (FAILED ? 'FAIL·' : 'PASS·') + (TOTAL - FAILED) + '/' + TOTAL;
+  window.__selftestDone = true;
+  window.__selftestFail = FAILED;
+})().catch(function (err) {
+  var box = document.getElementById('summary');
+  box.className = 'bad';
+  box.textContent = '测试中断：' + (err && err.message) + ' —— 中断点之后的断言没有执行';
+  document.title = 'BROKE';
+  window.__selftestDone = true;
+  window.__selftestFail = 999;
+});
+</script>
+</body>
+</html>

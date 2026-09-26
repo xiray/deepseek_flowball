@@ -1,0 +1,19 @@
+# 打包产物与签名私钥
+# .pem 是扩展的签名密钥 —— 泄漏了别人能签出「同一个扩展」，务必别提交
+*.crx
+*.pem
+*.zip
+
+# 系统垃圾
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+*~
+
+# 编辑器
+.idea/
+.vscode/

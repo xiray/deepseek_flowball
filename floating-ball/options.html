@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DeepSeek 悬浮球 · 设置</title>
+<style>
+  /* 只是页面底色。真正的界面样式在 options.js 里（和 panel.js 一个路子），
+     这样自检页加载同一份 js，看到的是同一个东西 */
+  html, body { margin: 0; min-height: 100%; background: #f4f5f7; }
+  @media (prefers-color-scheme: dark) { html, body { background: #17181b; } }
+</style>
+</head>
+<body>
+
+<!--
+  空壳页：界面由 options.js 自己建。
+  这里不能用内联脚本 —— MV3 扩展页的 CSP 禁止，逻辑必须放在外部文件里。
+-->
+<script src="config.js"></script>
+<script src="options.js"></script>
+</body>
+</html>

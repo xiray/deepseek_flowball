@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>API Key 自检（设置页 + 面板发请求）</title>
+<style>
+  body { margin: 0; padding: 12px; font: 12px/1.55 system-ui, "Microsoft YaHei"; background: #f7f8fa; }
+  h1 { font-size: 14px; margin: 0 0 8px; }
+  pre.rep { color: #fff; padding: 11px 13px; border-radius: 10px; margin: 0 0 10px;
+            white-space: pre-wrap; font: 12px/1.6 ui-monospace, Consolas, monospace; }
+  #repA { background: #0F6E56; }
+  #repB { background: #185FA5; }
+  /* 每块都要有自己的底色：忘了给底色的话，没跑完时是"白字 + 透明底" = 整块隐形，
+     报告没出来你都不知道有这么一块在等着 */
+  #repC { background: #534AB7; }
+  .note { color: #6a7076; font-size: 11.5px; margin: 0 0 10px; }
+</style>
+</head>
+<body>
+<h1>API Key 自检：① 设置页存进去 ② 面板发请求时带出去</h1>
+<p class="note">这个页面真加载 options.js 和 panel.js（不是复刻逻辑），把 chrome API 和 fetch 换成桩，逐项断言。</p>
+
+<!-- 「应用网页」的测试要用到"网页正文"：grabPage() 优先取 <main>，
+     所以把这小段放进 <main> 里 —— 上面那些报告文字一直在变，不隔离出来的话
+     正文指纹每轮都不一样，"增量缓存"永远命中不了（测试会假红）。 -->
+<main id="pageBody">
+  <h2>自检用的假网页</h2>
+  <p>第一段：这段话用来模拟网页正文，篇幅够长才好观察"到底有没有重复发送"。</p>
+  <p>第二段：再来一句，让正文有点长度，指纹变化才看得清楚。</p>
+</main>
+
+<pre class="rep" id="repA">设置页测试中…</pre>
+<pre class="rep" id="repB">面板测试中…</pre>
+<pre class="rep" id="repC">background 测试中…</pre>
+
+<script>
+// ---- 桩：chrome API ----
+var __store = {};                 // 假的 chrome.storage.local
+var storageListeners = [];        // 面板注册的 storage.onChanged —— 用它模拟"另一个窗口"
+function fireStorage(changes) { storageListeners.forEach(function (fn) { fn(changes, 'local'); }); }
+var openedOptions = 0;            // chrome.runtime.openOptionsPage 被调了几次
+var msgListeners = [];
+var installedListeners = [];      // background.js 注册的 onInstalled
+var panelBehavior = [];           // sidePanel.setPanelBehavior 收到的参数
+window.chrome = {
+  storage: {
+    local: {
+      get: function (k, cb) { setTimeout(function () { cb(__store); }, 0); },
+      set: function (o, cb) { Object.keys(o).forEach(function (kk) { __store[kk] = o[kk]; }); if (cb) setTimeout(cb, 0); },
+      remove: function (k, cb) {
+        Object.keys(__store).forEach(function (kk) { if (kk === k) { delete __store[kk]; } });
+        if (cb) setTimeout(cb, 0);
+      }
+    },
+    onChanged: { addListener: function (fn) { storageListeners.push(fn); } }
+  },
+  sidePanel: {
+    setPanelBehavior: function (o) { panelBehavior.push(o); return Promise.resolve(); }
+  },
+  runtime: {
+    id: 'test-extension-id',      // ctxAlive() 要有它，否则面板会以为扩展上下文失效了
+    sendMessage: function (m, cb) { if (cb) setTimeout(function () { cb({}); }, 0); },
+    openOptionsPage: function () { openedOptions++; },
+    onMessage: { addListener: function (fn) { msgListeners.push(fn); } },
+    onInstalled: { addListener: function (fn) { installedListeners.push(fn); } },
+    lastError: null
+  }
+};
+window.confirm = function () { return true; };     // 清空那个二次确认，自动点"确定"
+
+// ---- 桩：fetch ----
+// 记下每次真实请求（URL / 方法 / Authorization / body），然后回一个"像真的"的假响应。
+// 面板那条路会走 res.json() 分支（不给 body，等于非流式），所以 json() 得能给内容。
+var fetchCalls = [];
+// 下一条回答的内容：测「推荐图片」时要能控制模型返回什么（那段标记就是从这儿进来的）
+var nextReply = 'hi';
+window.fetch = function (url, opt) {
+  var body = null;
+  try { body = JSON.parse(opt && opt.body); } catch (e) {}
+  var u = String(url);
+  fetchCalls.push({
+    url: u,
+    method: (opt && opt.method) || 'GET',
+    auth: (opt && opt.headers && opt.headers.Authorization) || '',
+    model: body && body.model,
+    stream: !!(body && body.stream),
+    effort: body && body.reasoning_effort,
+    text: body && body.messages ? JSON.stringify(body.messages) : ''
+  });
+  if (u.indexOf('/user/balance') >= 0) {     // 查余额：官方那个只读接口的真实结构
+    return Promise.resolve({
+      ok: true, status: 200, body: null,
+      json: function () {
+        return Promise.resolve({
+          is_available: true,
+          balance_infos: [{ currency: 'CNY', total_balance: '42.50',
+                            granted_balance: '2.50', topped_up_balance: '40.00' }]
+        });
+      }
+    });
+  }
+  return Promise.resolve({
+    ok: true, status: 200, body: null,
+    json: function () { return Promise.resolve({ choices: [{ message: { content: nextReply } }] }); }
+  });
+};
+
+window.__DS_BALL = function () { return { x: 300, y: 260, size: 53 }; };
+window.__DS_BALL_VISIBLE = function () {};
+window.__DS_ICON_PATH = '';
+</script>
+
+<script src="../config.js"></script>
+<script src="../options.js"></script>
+<script src="../panel.js"></script>
+<script src="../background.js"></script>
+
+<script>
+function mkReport(id) {
+  var out = [], bad = 0;
+  return {
+    t: function (name, fn) {
+      try { fn(); out.push('✓ ' + name); }
+      catch (e) { bad++; out.push('✗ ' + name + ' → ' + e.message); }
+    },
+    line: function (s) { out.push('   ' + s); },
+    done: function (title) {
+      var d = document.getElementById(id);
+      d.style.background = bad ? '#dc2626' : '#0F6E56';
+      d.textContent = (bad ? title + '：有 ' + bad + ' 项没过' : title + '：全部通过 ✓') + '\n' + out.join('\n');
+      d.textContent += '\n（这一页的报头颜色就是结论：绿=全过）';
+    }
+  };
+}
+function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+</script>
+
+<script>
+// ============ ① 设置页 ============
+(async function () {
+  var R = mkReport('repA');
+  await wait(80);
+
+  var opt = window.__dsOptions;
+  var els = opt && opt.els ? opt.els() : null;
+
+  R.t('设置页建起来了（输入框是密码型）', function () {
+    if (!els || !els.key || !els.save) { throw new Error('options.js 没建出界面'); }
+    R.line('输入框 type=' + els.key.type);
+    if (els.key.type !== 'password') { throw new Error('不是密码型，键值等于明着摆屏幕上'); }
+  });
+
+  R.t('mask() 不把整串露出来', function () {
+    // 用假 key 当样例 —— 别拿真的（这文件是给人看的，截图、分享都容易带出去）
+    var k = 'sk-sample0123456789abcdefWXYZ';
+    var m = opt.mask(k);
+    R.line('sk-sample…WXYZ  →  ' + m);
+    if (m.indexOf('0123456789abcdef') >= 0 || m === k) { throw new Error('中间那段露出来了'); }
+    if (m.indexOf('sk-sam') !== 0 || m.indexOf('WXYZ') < 0) { throw new Error('头尾没保留，看不出是哪个 key'); }
+  });
+
+  // config.js 里那条旧写法：模拟"升级上来的老配置"，值还在文件里
+  // （先把输入框清空 —— 预填只在"框里是空的"时才发生，否则这条会依赖 config.js 当前
+  //   恰好没有 key，等于测了个偶然）
+  window.DS_CONFIG.apiKey = 'sk-legacy-OLDKEY-1234';
+  els.key.value = '';
+  await opt.refresh();
+  R.t('config.js 里还有旧 key 时：给出提示 + 自动填进输入框', function () {
+    R.line('提示块 hidden = ' + els.legacy.hidden + '  输入框 = ' + JSON.stringify(els.key.value));
+    if (els.legacy.hidden) { throw new Error('没提示 config.js 里还留着旧 key'); }
+    if (els.key.value !== 'sk-legacy-OLDKEY-1234') { throw new Error('没预填，用户还得手动复制一遍'); }
+  });
+
+  window.DS_CONFIG.apiKey = '';        // 后面的测试按"代码里没有 key"来
+  els.key.value = 'sk-test-abcdefghijkl';
+  var saved = await opt.save();
+  R.t('点保存 → 写进 chrome.storage（代码里那份还是空的）', function () {
+    R.line('store.__ds_key__ = ' + JSON.stringify(__store.__ds_key__) +
+           '   config.js 的 apiKey = ' + JSON.stringify(window.DS_CONFIG.apiKey));
+    R.line('状态：' + els.st.textContent + '（' + els.st.className + '）');
+    if (!saved) { throw new Error('save() 返回 false'); }
+    if (__store.__ds_key__ !== 'sk-test-abcdefghijkl') { throw new Error('没存进 storage'); }
+    if (els.st.className.indexOf('ok') < 0) { throw new Error('状态不是"成功"样式'); }
+  });
+
+  var before = fetchCalls.length;
+  var st = await opt.test();
+  R.t('点「测试连接」→ 真打了一次接口，头里带着 Key', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    R.line('请求 ' + c.url);
+    R.line('Authorization = ' + c.auth + '   model = ' + c.model + '   max_tokens 那类非流式 = ' + (c.stream === false));
+    R.line('状态：' + els.st.textContent);
+    if (fetchCalls.length !== before + 1) { throw new Error('没发请求（或发了多次）'); }
+    if (c.url !== 'https://api.deepseek.com/chat/completions') { throw new Error('URL 不对：' + c.url); }
+    if (c.auth !== 'Bearer sk-test-abcdefghijkl') { throw new Error('Authorization 不对：' + c.auth); }
+    if (st !== 200) { throw new Error('没认成 200'); }
+    if (els.st.textContent.indexOf('✓') < 0) { throw new Error('没报告成功'); }
+  });
+
+  // 空着点保存不能把已有的 key 弄丢（很多人会先清空输入框再点保存）
+  els.key.value = '';
+  var emptySave = await opt.save();
+  R.t('输入框空着点保存：拒绝保存，也不动 storage 里已有的那份', function () {
+    R.line('状态：' + els.st.textContent + '（' + els.st.className + '）');
+    R.line('store.__ds_key__ 还在 = ' + JSON.stringify(__store.__ds_key__));
+    if (emptySave) { throw new Error('空的也让它保存了'); }
+    if (__store.__ds_key__ !== 'sk-test-abcdefghijkl') { throw new Error('把原来存着的 key 弄丢了'); }
+  });
+
+  await opt.clear();
+  R.t('点清空 → storage 里的 key 被删掉、界面说清当前状态', function () {
+    R.line('store.__ds_key__ = ' + JSON.stringify(__store.__ds_key__) +
+           '   ' + els.st.textContent);
+    R.line('当前状态行：' + els.cur.textContent);
+    if ('__ds_key__' in __store) { throw new Error('清空没生效'); }
+    if (els.cur.textContent.indexOf('还没配') < 0) { throw new Error('没告诉用户当前没配'); }
+  });
+
+  R.done('设置页');
+  window.__optionsDone = true;      // 下一块别抢：这一块会往 store 里写 key 又清掉
+})();
+</script>
+
+<script>
+// ============ ② 面板发请求时 Key 从哪来 ============
+(async function () {
+  var R = mkReport('repB');
+  // 三块共用一个假的 chrome.storage，**必须排队**：上一块（设置页）会往 store 里写 key 再清掉，
+  // 这一块要验的恰恰是"没配 Key 时"的行为。靠 setTimeout 猜时间会互相污染 ——
+  // 症状就是"新加了一条测试，别的老测试突然红了"。
+  for (var w = 0; w < 250 && !window.__optionsDone; w++) { await wait(20); }
+  await wait(60);
+
+  window.__dsPanel.open();
+  await wait(120);                       // initData() 是异步的（要读存储）
+  var host = document.getElementById('__ds_float_panel__');
+  var sr = host && host.shadowRoot;
+  if (!sr) { R.t('面板没建起来', function () { throw new Error('没有 shadowRoot'); }); window.__panelDone = true; R.done('面板'); return; }
+  var input = sr.querySelector('#input');
+  var send = sr.querySelector('#send');
+  var gear = sr.querySelector('#set');
+
+  R.t('面板上多了一个 ⚙（设置入口）', function () {
+    R.line('⚙ 存在 = ' + !!gear + (gear ? '  title=' + JSON.stringify(gear.title) : ''));
+    if (!gear) { throw new Error('没找到 #set'); }
+  });
+
+  R.t('没配 Key 时 ⚙ 是点亮提醒状态', function () {
+    R.line('class = ' + JSON.stringify(gear.className) + '   title = ' + JSON.stringify(gear.title));
+    if (!gear.classList.contains('warn')) { throw new Error('没有提醒，用户不知道缺东西'); }
+  });
+
+  var before = fetchCalls.length;
+  input.value = '你好';
+  send.click();
+  await wait(120);
+  R.t('没配 Key 时点发送：明确提示去哪配，而且**不发请求**', function () {
+    var toast = sr.querySelector('#toast').textContent;
+    R.line('提示 = ' + JSON.stringify(toast));
+    R.line('这期间发出的请求数 = ' + (fetchCalls.length - before));
+    if (fetchCalls.length !== before) { throw new Error('没 Key 还是发了请求'); }
+    if (toast.indexOf('API Key') < 0) { throw new Error('提示里没说 Key 的事'); }
+    if (toast.indexOf('config.js') >= 0) { throw new Error('还在让用户去改代码'); }
+  });
+
+  // 现在"在浏览器里配好了"
+  __store.__ds_key__ = 'sk-browser-1234567890';
+  input.value = '你好';
+  send.click();
+  await wait(200);
+  R.t('配好之后：请求带上了浏览器里那份 Key（不是代码里的）', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    R.line('请求 ' + c.url);
+    R.line('Authorization = ' + c.auth + '   model = ' + c.model + '   stream = ' + c.stream + '   effort = ' + c.effort);
+    if (fetchCalls.length !== before + 1) { throw new Error('请求数不对：' + (fetchCalls.length - before)); }
+    if (c.auth !== 'Bearer sk-browser-1234567890') { throw new Error('Authorization 不对：' + c.auth); }
+    if (!c.stream) { throw new Error('没带 stream:true'); }
+    if (!c.effort) { throw new Error('没带上思考强度'); }
+  });
+
+  R.t('回答渲染进了气泡（这条路是通的，不只是发了请求）', function () {
+    var bodies = sr.querySelectorAll('.body');
+    var last = bodies[bodies.length - 1];
+    R.line('最后一条回答 = ' + JSON.stringify(last ? last.textContent.trim() : null));
+    if (!last || last.textContent.indexOf('hi') < 0) { throw new Error('回答没渲染出来'); }
+  });
+
+  R.t('配好之后 ⚙ 不再点亮', function () {
+    R.line('class = ' + JSON.stringify(gear.className) + '   title = ' + JSON.stringify(gear.title));
+    if (gear.classList.contains('warn')) { throw new Error('配好了还在提醒'); }
+  });
+
+  // ⚙ 是"配 Key"的唯一入口，点了必须真去开设置页。
+  // 这条以前没人验：桩里记了 openedOptions，却一个断言都没有（等于白记）。
+  R.t('点 ⚙ → 真去调 chrome.runtime.openOptionsPage', function () {
+    var b = openedOptions;
+    gear.click();
+    R.line('openOptionsPage 调用次数 ' + b + ' → ' + openedOptions);
+    if (openedOptions !== b + 1) { throw new Error('点了 ⚙ 没去开设置页'); }
+  });
+
+  R.t('老 Chrome 没有 openOptionsPage 时 → 退化成提示，不静默失败', function () {
+    var keep = chrome.runtime.openOptionsPage;
+    chrome.runtime.openOptionsPage = undefined;
+    try {
+      gear.click();
+      var t = sr.querySelector('#toast').textContent;
+      R.line('提示 = ' + JSON.stringify(t));
+      if (t.indexOf('扩展选项') < 0) { throw new Error('没告诉用户去哪儿配'); }
+    } finally { chrome.runtime.openOptionsPage = keep; }
+  });
+
+  R.t('工具栏里多了一个查余额的按钮', function () {
+    var bal = sr.querySelector('#bal');
+    R.line('余额按钮存在 = ' + !!bal + (bal ? '  title=' + JSON.stringify(bal.title) : ''));
+    if (!bal) { throw new Error('没找到 #bal'); }
+  });
+
+  var balBefore = fetchCalls.length;
+  sr.querySelector('#bal').click();
+  await wait(150);                      // 查余额是异步的：fetch → json → 写提示
+  R.t('点余额按钮 → GET /user/balance，带 Key，余额进提示', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    var t = sr.querySelector('#toast').textContent;
+    R.line('请求 ' + c.method + ' ' + c.url);
+    R.line('Authorization = ' + c.auth);
+    R.line('提示 = ' + JSON.stringify(t));
+    if (fetchCalls.length !== balBefore + 1) { throw new Error('没发请求，或发了 ' + (fetchCalls.length - balBefore) + ' 次'); }
+    if (c.url !== 'https://api.deepseek.com/user/balance') { throw new Error('URL 不对：' + c.url); }
+    if (c.method !== 'GET') { throw new Error('查余额该是 GET，实际 ' + c.method); }
+    if (c.auth !== 'Bearer sk-browser-1234567890') { throw new Error('Authorization 不对：' + c.auth); }
+    if (t.indexOf('42.50') < 0) { throw new Error('提示里没有余额数字：' + t); }
+    if (t.indexOf('¥') < 0) { throw new Error('提示里没有货币符号：' + t); }
+  });
+
+  // ---- 划词选段：挂成蓝色 chip，发送时才把「提示词 + 选区」拼进消息 ----
+  window.__dsPanel.askSelection({
+    label: '翻译', prompt: '把下面这段翻译成中文：', text: '要翻译的原文'
+  });
+  R.t('划词 → 输入框保持干净，内容挂成 chip', function () {
+    var chips = Array.prototype.map.call(sr.querySelectorAll('.chip'), function (c) {
+      return c.textContent.replace(/\s+/g, ' ').trim();
+    });
+    R.line('chips = ' + JSON.stringify(chips));
+    R.line('输入框 = ' + JSON.stringify(input.value));
+    if (!chips.some(function (n) { return n.indexOf('翻译 ·') === 0; })) { throw new Error('没有「翻译 · N 字」chip'); }
+    if (input.value) { throw new Error('把正文灌进输入框了'); }
+  });
+
+  var selBefore = fetchCalls.length;
+  send.click();
+  await wait(220);
+  R.t('发送时把「提示词 + 选中的文字」拼进了消息', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    var t = c ? (c.text || '') : '';
+    R.line('消息 = ' + t.slice(0, 200));
+    if (fetchCalls.length !== selBefore + 1) { throw new Error('没发出去（或发了多次）'); }
+    if (t.indexOf('把下面这段翻译成中文：') < 0) { throw new Error('提示词没进消息'); }
+    if (t.indexOf('要翻译的原文') < 0) { throw new Error('选中的文字没进消息'); }
+  });
+
+  R.t('发完 chip 清掉（不会粘到下一轮）', function () {
+    var chips = Array.prototype.map.call(sr.querySelectorAll('.chip'), function (c) {
+      return c.textContent.replace(/\s+/g, ' ').trim();
+    });
+    R.line('chips = ' + JSON.stringify(chips));
+    if (chips.some(function (n) { return n.indexOf('翻译 ·') === 0; })) { throw new Error('chip 没清掉'); }
+  });
+
+  // ---- 粘贴图片（Ctrl+V）：截图直接进附件，纯文字不插手 ----
+  // 造一张真图：canvas 画 8×8 → toDataURL → 字节 → File，塞进 DataTransfer 当剪贴板。
+  function makePng(name) {
+    var c = document.createElement('canvas');
+    c.width = 240; c.height = 140;
+    var cx = c.getContext('2d');
+    cx.fillStyle = '#e8eaee';
+    cx.fillRect(0, 0, 240, 140);
+    cx.fillStyle = '#4D6BFE';
+    cx.fillRect(24, 24, 192, 92);
+    cx.fillStyle = '#fff';
+    cx.font = '16px "Microsoft YaHei", sans-serif';
+    cx.fillText('图片预览', 84, 66);
+    cx.font = '11px "Microsoft YaHei", sans-serif';
+    cx.fillText('（双击附件看到的就长这样）', 56, 92);
+    var b64 = c.toDataURL('image/png').split(',')[1];
+    var bytes = Uint8Array.from(atob(b64), function (ch) { return ch.charCodeAt(0); });
+    return new File([bytes], name, { type: 'image/png' });
+  }
+  function firePaste(file, text) {
+    var dt = new DataTransfer();
+    if (file) { dt.items.add(file); }
+    if (text) { dt.setData('text/plain', text); }
+    var ev = new ClipboardEvent('paste', {
+      clipboardData: dt, bubbles: true, composed: true, cancelable: true
+    });
+    (sr.querySelector('#input') || document.body).dispatchEvent(ev);
+    return ev;
+  }
+
+  var evImg = firePaste(makePng('shot.png'), '');
+  R.t('粘贴截图 → 接管这次粘贴（不让浏览器往输入框塞文件名/HTML）', function () {
+    R.line('defaultPrevented = ' + evImg.defaultPrevented);
+    if (!evImg.defaultPrevented) { throw new Error('没接管，图会被丢掉'); }
+  });
+
+  await wait(250);                      // FileReader 是异步的，chip 要等一会儿
+  R.t('截图真的进了附件（chip 上有文件名）', function () {
+    var names = Array.prototype.map.call(sr.querySelectorAll('.chip'), function (c) {
+      return c.textContent.replace(/\s+/g, ' ').trim();
+    });
+    R.line('附件 chips = ' + JSON.stringify(names));
+    R.line('提示 = ' + JSON.stringify(sr.querySelector('#toast').textContent));
+    if (!names.some(function (n) { return n.indexOf('shot.png') >= 0; })) {
+      throw new Error('附件里没有那张图');
+    }
+  });
+
+  R.t('纯文字粘贴不插手（走浏览器默认行为）', function () {
+    var evText = firePaste(null, '一段普通文字');
+    R.line('defaultPrevented = ' + evText.defaultPrevented);
+    if (evText.defaultPrevented) { throw new Error('把普通文字粘贴也吃掉了，用户会以为输不进字'); }
+  });
+
+  // ---- 图片附件双击预览（只针对"这次待发的附件"）----
+  R.t('图片附件的 chip 带缩略图、并且标明能双击', function () {
+    var chip = sr.querySelector('.chip.viewable');
+    var th = chip ? chip.querySelector('img.th') : null;
+    R.line('可预览 chip = ' + !!chip + '   缩略图 = ' + !!th +
+           '   src = ' + (th ? String(th.src).slice(0, 22) + '…' : '—'));
+    R.line('title = ' + JSON.stringify(chip ? chip.title : null));
+    if (!chip) { throw new Error('图片 chip 上没有 viewable 标记'); }
+    if (!th) { throw new Error('没有缩略图'); }
+    if (String(th.src).indexOf('data:image/') !== 0) { throw new Error('缩略图 src 不是这张图'); }
+    if (!chip.title) { throw new Error('没告诉用户能双击看'); }
+  });
+
+  R.t('双击 → 预览层打开，铺的是那张图', function () {
+    sr.querySelector('.chip.viewable').dispatchEvent(
+      new MouseEvent('dblclick', { bubbles: true, composed: true, cancelable: true }));
+    var v = sr.querySelector('#viewer');
+    var img = sr.querySelector('#vimg');
+    var cap = sr.querySelector('#vcap').textContent;
+    R.line('viewer 显示 = ' + (v ? v.classList.contains('show') : '—') +
+           '   vimg = ' + String(img ? img.src : '').slice(0, 22) + '…');
+    R.line('一行说明 = ' + JSON.stringify(cap));
+    if (!v || !v.classList.contains('show')) { throw new Error('预览层没打开'); }
+    if (String(img.src).indexOf('data:image/') !== 0) { throw new Error('预览里没有图'); }
+    if (cap.indexOf('shot.png') < 0) { throw new Error('说明里没有文件名'); }
+  });
+
+  R.t('点一下预览层 → 关掉（顺手松开那份 base64）', function () {
+    var v = sr.querySelector('#viewer');
+    v.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+    R.line('viewer 显示 = ' + v.classList.contains('show') +
+           '   vimg.src = ' + JSON.stringify(sr.querySelector('#vimg').src));
+    if (v.classList.contains('show')) { throw new Error('点了没关'); }
+    if (sr.querySelector('#vimg').src) { throw new Error('没松开 src，base64 还挂着'); }
+  });
+
+  // 最后再把预览打开一次：这个页面本来就是给人看的，留一张"预览长什么样"的效果图
+  (function reopenForShot() {
+    var chip = sr.querySelector('.chip.viewable');
+    if (!chip) { return; }
+    chip.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, composed: true, cancelable: true }));
+    R.line('（已把预览重新打开，方便截图留档）');
+  })();
+
+  // ---- 网页正文的增量缓存（省 token 的核心）----
+  // 打开「应用网页」（整页）→ 第一次发送带全文；页面没变时再问 → 只发一行"没变"的标记；
+  // 页面改了 → 必须重发全文（否则模型手里是旧的那份）。
+  sr.querySelector('#page').click();
+  await wait(200);                        // togglePageCtx 是异步的（要抓正文）
+  R.t('打开「应用网页」→ chip 上写着整页', function () {
+    var chip = sr.querySelector('.chip.page');
+    R.line('chip = ' + JSON.stringify(chip ? chip.textContent.replace(/\s+/g, ' ').trim() : null));
+    if (!chip || chip.textContent.indexOf('整页：') !== 0) { throw new Error('没切到整页模式'); }
+  });
+
+  var p1 = fetchCalls.length;
+  input.value = '这页讲了啥';
+  send.click();
+  await wait(250);
+  var firstFull = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  function countIn(hay, needle) { return hay.split(needle).length - 1; }
+  var MARK = '第一段：这段话用来模拟网页正文';
+  R.t('第一次发送：整页正文一起发出去', function () {
+    R.line('请求里正文出现 ' + countIn(firstFull, MARK) + ' 次，共 ' + firstFull.length + ' 字符');
+    if (fetchCalls.length !== p1 + 1) { throw new Error('没发出去'); }
+    if (firstFull.indexOf('【当前网页：') < 0) { throw new Error('没带本页正文'); }
+    if (countIn(firstFull, MARK) !== 1) { throw new Error('正文没进去'); }
+  });
+
+  var p2 = fetchCalls.length;
+  input.value = '再细说说第二段';
+  send.click();
+  await wait(250);
+  var secondFull = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('页面没变时再问：正文只留历史里那一份，不再追加一遍', function () {
+    // 注意：不能断言"请求里没有正文" —— 上一轮的消息就在历史里，正文当然还在。
+    // 要断言的是**出现次数**：复用成功 = 1 次（只有历史那份）；没复用 = 2 次（历史 + 又追加一份）。
+    var n = countIn(secondFull, MARK);
+    R.line('正文出现 ' + n + ' 次（复用成功应为 1）  请求 ' + secondFull.length + ' 字符');
+    R.line('提示 = ' + JSON.stringify(sr.querySelector('#toast').textContent));
+    R.line('chip = ' + JSON.stringify((sr.querySelector('.chip.page') || {}).textContent));
+    if (fetchCalls.length !== p2 + 1) { throw new Error('没发出去'); }
+    if (secondFull.indexOf('完全相同') < 0) { throw new Error('没有那行"没变"的标记'); }
+    if (n !== 1) { throw new Error('正文被重复带了 ' + n + ' 遍'); }
+    if (secondFull.indexOf('再细说说第二段') < 0) { throw new Error('这轮的提问没发出去'); }
+    if (((sr.querySelector('.chip.page') || {}).textContent || '').indexOf('正文已缓存') < 0) {
+      throw new Error('chip 上没有标出"正文已缓存"');
+    }
+  });
+
+  // 页面变了 → 必须重发全文
+  var extra = document.createElement('p');
+  extra.textContent = '第三段：这是新加的一段，页面内容变了。';
+  document.getElementById('pageBody').appendChild(extra);
+  var p3 = fetchCalls.length;
+  input.value = '现在这页呢';
+  send.click();
+  await wait(250);
+  var thirdFull = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('页面改了 → 重新发全文（不能拿旧内容糊弄模型）', function () {
+    R.line('请求里含新段落 = ' + (thirdFull.indexOf('第三段：这是新加的一段') >= 0));
+    if (fetchCalls.length !== p3 + 1) { throw new Error('没发出去'); }
+    if (thirdFull.indexOf('第三段：这是新加的一段') < 0) { throw new Error('页面变了却没重发，模型手里是旧的'); }
+  });
+
+  // ---- 会话回滚（最小版）：回到某条之前 + 把那条放回输入框 ----
+  var rowsBeforeRoll = sr.querySelectorAll('.row').length;
+  R.t('用户气泡上有「回到这里」，助手气泡上没有', function () {
+    var backs = sr.querySelectorAll('.cp-back');
+    var users = sr.querySelectorAll('.row.me');
+    var onAi = sr.querySelector('.row.ai .cp-back');
+    R.line('消息 ' + rowsBeforeRoll + ' 条（用户 ' + users.length + '）· 回滚按钮 ' + backs.length + ' 个');
+    if (!backs.length) { throw new Error('没有回滚按钮'); }
+    if (backs.length !== users.length) { throw new Error('按钮数和用户消息数不一致'); }
+    if (onAi) { throw new Error('助手气泡上不该有回滚按钮'); }
+  });
+
+  // 第三颗（index 4 =「这页讲了啥」）就是带整页正文的那一轮
+  sr.querySelectorAll('.row.me')[2].querySelector('.cp-back').click();
+  R.t('点「回到这里」→ 先弹确认层，把代价写清楚', function () {
+    var cfm = sr.querySelector('#cfm');
+    var msg = sr.querySelector('#cfm-m').textContent;
+    R.line('显示 = ' + cfm.classList.contains('show'));
+    R.line('标题 = ' + JSON.stringify(sr.querySelector('#cfm-t').textContent));
+    R.line('说明 = ' + JSON.stringify(msg));
+    if (!cfm.classList.contains('show')) { throw new Error('没弹确认层 —— 不可逆操作必须确认'); }
+    if (msg.indexOf('丢掉') < 0) { throw new Error('没写清楚要丢多少'); }
+    if (msg.indexOf('放回输入框') < 0) { throw new Error('没说明这条会回填'); }
+  });
+
+  R.t('点「算了」→ 什么都不动', function () {
+    sr.querySelector('#cfm-no').click();
+    R.line('确认层 = ' + sr.querySelector('#cfm').classList.contains('show') +
+           '   消息 ' + sr.querySelectorAll('.row').length + ' 条');
+    if (sr.querySelector('#cfm').classList.contains('show')) { throw new Error('确认层没关'); }
+    if (sr.querySelectorAll('.row').length !== rowsBeforeRoll) { throw new Error('消息被动了'); }
+  });
+
+  sr.querySelectorAll('.row.me')[2].querySelector('.cp-back').click();
+  sr.querySelector('#cfm-yes').click();
+  await wait(120);
+  R.t('确认后：截断到这条之前，这条的文字回填输入框', function () {
+    R.line('消息 ' + rowsBeforeRoll + ' → ' + sr.querySelectorAll('.row').length +
+           '   输入框 = ' + JSON.stringify(input.value));
+    if (sr.querySelectorAll('.row').length !== 4) { throw new Error('没截断到 4 条'); }
+    if (input.value.indexOf('这页讲了啥') < 0) { throw new Error('没把这条放回输入框'); }
+  });
+
+  var n4 = fetchCalls.length;
+  send.click();
+  await wait(250);
+  var afterRoll = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('回滚后再发：正文重新发全文，不留指向已删消息的「完全相同」标记', function () {
+    R.line('正文出现 ' + countIn(afterRoll, MARK) + ' 次；含「完全相同」= ' + (afterRoll.indexOf('完全相同') >= 0));
+    if (fetchCalls.length !== n4 + 1) { throw new Error('没发出去'); }
+    if (countIn(afterRoll, MARK) !== 1) { throw new Error('正文没重发 —— 载体的消息被删了，模型手里会缺正文'); }
+    if (afterRoll.indexOf('完全相同') >= 0) { throw new Error('还留着指向已删消息的标记，模型会去上面找一条不存在的消息'); }
+  });
+
+  // ---- 「推荐图片」：一颗开关 + 只让模型给搜索词 + 渲染成可点的小块 ----
+  var recoBtn = sr.querySelector('#reco');
+
+  R.t('输入框上方多了一颗「推荐图片」，默认是关的', function () {
+    R.line('按钮 = ' + !!recoBtn + '   文字 = ' + JSON.stringify(recoBtn && recoBtn.textContent) +
+           '   点亮 = ' + !!(recoBtn && recoBtn.classList.contains('on')));
+    if (!recoBtn) { throw new Error('没找到 #reco'); }
+    if (recoBtn.classList.contains('on')) { throw new Error('默认就亮着（存储里有残留？）'); }
+  });
+
+  var nR0 = fetchCalls.length;
+  nextReply = '关着的时候的回答';
+  input.value = '关着时问一句';
+  send.click();
+  await wait(220);
+  R.t('关着时：请求里不带那段「配图搜索词」的要求', function () {
+    var t = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+    // 判据用要求里特有的措辞，不用 'img-reco' —— 历史回答里本来就可能有那个标记
+    R.line('请求里有那条要求吗 = ' + (t.indexOf('搜索关键词') >= 0));
+    if (fetchCalls.length !== nR0 + 1) { throw new Error('没发出去'); }
+    if (t.indexOf('搜索关键词') >= 0) { throw new Error('没开也把要求发出去了'); }
+  });
+
+  recoBtn.click();
+  R.t('点一下开启：按钮点亮，而且记住了（存进浏览器）', function () {
+    R.line('点亮 = ' + recoBtn.classList.contains('on') +
+           '   存储 = ' + JSON.stringify(__store.__ds_imgreco__) +
+           '   提示 = ' + JSON.stringify(sr.querySelector('#toast').textContent));
+    if (!recoBtn.classList.contains('on')) { throw new Error('没点亮'); }
+    if (__store.__ds_imgreco__ !== true) { throw new Error('没存下来，刷新一下就忘了'); }
+  });
+
+  nextReply = '这是正文。\n\n<img-reco>蓝色鲸鱼 扁平插画 | 深海 摄影</img-reco>';
+  input.value = '开着时问一句';
+  send.click();
+  await wait(260);
+
+  R.t('开着时：请求里多了一条「末尾给配图搜索词」的要求', function () {
+    var t = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+    R.line('要求片段 = ' + JSON.stringify((t.match(/另外，在回答的最后[^"]{0,30}/) || ['（没找到）'])[0]));
+    if (t.indexOf('img-reco') < 0) { throw new Error('没把要求发出去'); }
+    if (t.indexOf('搜索关键词') < 0) { throw new Error('要求里没说清是要搜索词'); }
+  });
+
+  var lastRow = null;
+  R.t('那段标记不会露在正文里（用户只看到正文）', function () {
+    var rows = sr.querySelectorAll('.row');
+    lastRow = rows[rows.length - 1];
+    var body = lastRow.querySelector('.body').textContent;
+    R.line('正文 = ' + JSON.stringify(body));
+    if (body.indexOf('img-reco') >= 0) { throw new Error('标记露出来了'); }
+    if (body.indexOf('这是正文') < 0) { throw new Error('正文没渲染出来'); }
+  });
+
+  R.t('气泡底部出现「配图」+ 可点的小块，点开就是搜图', function () {
+    var box = lastRow ? lastRow.querySelector('.reco') : null;
+    var links = box ? box.querySelectorAll('.reco-k') : [];
+    var href = links[0] ? links[0].getAttribute('href') : '';
+    R.line('配图行 = ' + !!box + '   块数 = ' + links.length);
+    R.line('第一个 = ' + JSON.stringify(links[0] && links[0].textContent) + ' → ' + href);
+    R.line('target = ' + (links[0] && links[0].target) + '   rel = ' + (links[0] && links[0].rel));
+    if (!box || !links.length) { throw new Error('没有配图小块'); }
+    if (links.length !== 2) { throw new Error('块数不对：' + links.length); }
+    if (links[0].textContent !== '蓝色鲸鱼 扁平插画') { throw new Error('第一个词不对'); }
+    if (href.indexOf('image.baidu.com') < 0) { throw new Error('不是搜图地址：' + href); }
+    if (href.indexOf(encodeURIComponent('蓝色鲸鱼 扁平插画')) < 0) { throw new Error('词没拼进链接'); }
+    if (links[0].target !== '_blank') { throw new Error('不是在新标签页打开'); }
+  });
+
+  nextReply = '这次我没给搜索词。';
+  input.value = '没给词的那种';
+  send.click();
+  await wait(240);
+  R.t('模型没给搜索词时：那一行不显示（不硬凑）', function () {
+    var rows = sr.querySelectorAll('.row');
+    var box = rows[rows.length - 1].querySelector('.reco');
+    var shown = !!(box && box.style.display !== 'none' && box.querySelectorAll('.reco-k').length);
+    R.line('配图行显示 = ' + shown);
+    if (shown) { throw new Error('一个词都没有还占着一行'); }
+  });
+
+  var nR9 = fetchCalls.length;
+  recoBtn.click();
+  nextReply = '关了以后的回答';
+  input.value = '关掉再问一句';
+  send.click();
+  await wait(220);
+  R.t('再点一下关闭：那条约求没了，历史里的旧标记也不会再发出去', function () {
+    var t = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+    R.line('点亮 = ' + recoBtn.classList.contains('on') +
+           '   有要求吗 = ' + (t.indexOf('搜索关键词') >= 0) +
+           '   有 img-reco 标记吗 = ' + (t.indexOf('img-reco') >= 0));
+    if (fetchCalls.length !== nR9 + 1) { throw new Error('没发出去'); }
+    if (t.indexOf('搜索关键词') >= 0) { throw new Error('关了还带着要求'); }
+    // 上一轮的回答里带过 <img-reco>，但发给模型的历史里应该已经剥掉了（否则模型会跟着学）
+    if (t.indexOf('img-reco') >= 0) { throw new Error('历史里还留着标记，模型会以为这格式要一直带着'); }
+  });
+
+  // ---- 多窗口同步（模拟"另一个标签页也在聊"）----
+  R.t('面板注册了 storage.onChanged（下面几条靠它模拟另一个窗口）', function () {
+    R.line('注册的监听器 = ' + storageListeners.length);
+    if (!storageListeners.length) { throw new Error('没注册，多窗口那套逻辑等于是裸的'); }
+  });
+
+  function chatCount() { return sr.querySelectorAll('.hitem').length; }
+
+  R.t('别的窗口新建了对话 → 这边把它收下（抽屉里多一条）', function () {
+    var before = chatCount();
+    __store.__ds_chats__ = (__store.__ds_chats__ || []).concat([{
+      id: 'other1', title: '别的窗口建的', updatedAt: Date.now(),
+      messages: [{ role: 'user', content: 'hi', show: 'hi' }, { role: 'assistant', content: 'yo', show: 'yo' }]
+    }]);
+    fireStorage({ '__ds_chats__': { newValue: __store.__ds_chats__ } });
+    var after = chatCount();
+    R.line('抽屉条数 ' + before + ' → ' + after);
+    if (after !== before + 1) { throw new Error('没并进来'); }
+  });
+
+  R.t('别的窗口删了对话 → 这边也删（不然留一条幽灵，下次写盘还会把它救活）', function () {
+    var before = chatCount();
+    __store.__ds_chats__ = (__store.__ds_chats__ || []).filter(function (c) { return c.id !== 'other1'; });
+    fireStorage({ '__ds_chats__': { newValue: __store.__ds_chats__ } });
+    var after = chatCount();
+    R.line('抽屉条数 ' + before + ' → ' + after);
+    if (after !== before - 1) { throw new Error('幽灵没清掉'); }
+  });
+
+  // ---- 导出 / 清理 ----
+  R.t('历史抽屉底部有两个按钮（导出 md / 清理旧对话）', function () {
+    var e = sr.querySelector('#exp'), c2 = sr.querySelector('#cln');
+    R.line('左边 = ' + JSON.stringify(e && e.textContent) + '   右边 = ' + JSON.stringify(c2 && c2.textContent));
+    if (!e || !c2) { throw new Error('少按钮'); }
+  });
+
+  R.t('点「导出 md」→ 生成并把文件名报给你（下载动作本身无头里验不了）', function () {
+    var n = (__store.__ds_chats__ || []).filter(function (c) { return (c.messages || []).length; }).length;
+    sr.querySelector('#exp').click();
+    var t = sr.querySelector('#toast').textContent;
+    R.line('提示 = ' + JSON.stringify(t));
+    R.line('（这次应该导出 ' + n + ' 个有内容的对话）');
+    if (t.indexOf('已导出') < 0) { throw new Error('没提示成功：' + t); }
+    if (t.indexOf('.md') < 0) { throw new Error('提示里没有文件名'); }
+  });
+
+  R.t('点「清理旧对话」→ 先弹确认层，把"删几个、多久以前的"写清楚', function () {
+    __store.__ds_chats__ = (__store.__ds_chats__ || []).concat([{
+      id: 'ancient', title: '很久以前', updatedAt: Date.now() - 40 * 86400000,
+      messages: [{ role: 'user', content: '旧问题', show: '旧问题' },
+                 { role: 'assistant', content: '旧回答', show: '旧回答' }]
+    }]);
+    fireStorage({ '__ds_chats__': { newValue: __store.__ds_chats__ } });
+    sr.querySelector('#cln').click();
+    var cfm = sr.querySelector('#cfm');
+    R.line('确认层显示 = ' + cfm.classList.contains('show'));
+    R.line('标题 = ' + JSON.stringify(sr.querySelector('#cfm-t').textContent));
+    R.line('说明 = ' + JSON.stringify(sr.querySelector('#cfm-m').textContent));
+    R.line('按钮 = ' + JSON.stringify(sr.querySelector('#cfm-yes').textContent));
+    if (!cfm.classList.contains('show')) { throw new Error('没弹确认层，直接就删了'); }
+    if (sr.querySelector('#cfm-m').textContent.indexOf('30 天') < 0) { throw new Error('没说清删的是什么'); }
+  });
+
+  R.t('确认之后：40 天前那条被删掉，新的都还在', function () {
+    var before = chatCount();
+    sr.querySelector('#cfm-yes').click();
+    var after = chatCount();
+    R.line('抽屉条数 ' + before + ' → ' + after + '   提示 = ' + JSON.stringify(sr.querySelector('#toast').textContent));
+    if (after !== before - 1) { throw new Error('没删掉那一条'); }
+    if (sr.querySelector('#toast').textContent.indexOf('已清理') < 0) { throw new Error('没有清理提示'); }
+  });
+
+  // ---- 历史里的图片只带最近几条 ----
+  // 官方一张图最多算 1024 token（钱不多），但一张图压完也是几万字符的 data URL，
+  // 每轮把老图重发一遍纯粹在撑大请求体。所以只留最近 MAX_CTX_IMAGES 条。
+  for (var kk = 0; kk < 5; kk++) {
+    firePaste(makePng('p' + kk + '.png'), '');
+    await wait(140);
+    input.value = '带图第 ' + (kk + 1) + ' 轮';
+    send.click();
+    await wait(240);
+  }
+  var lastReq = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  var nUser = (lastReq.match(/"role":"user"/g) || []).length;
+  var nImg = (lastReq.match(/"type":"image_url"/g) || []).length;
+
+  R.t('连着 5 轮各带一张图 → 请求里只发最近 3 张，更早的只留文字', function () {
+    R.line('这轮请求里 user 消息 ' + nUser + ' 条，其中带图 ' + nImg + ' 张');
+    if (nUser < 5) { throw new Error('历史不够 5 条，这条断言没意义（实际 ' + nUser + '）'); }
+    if (nImg !== 3) { throw new Error('带图条数不对：' + nImg + '（应该是 3）'); }
+  });
+
+  // ---- 两个标签页真的"通"了：模拟另一个窗口往同一个对话里写 ----
+  // fireStorage 会把面板注册的 storage.onChanged 真的调起来（跟另一个标签页写的效果一样）。
+  function chatsInStore() { return __store.__ds_chats__ || []; }
+  function cloneStore() { return JSON.parse(JSON.stringify(chatsInStore())); }
+
+  R.t('另一个窗口往当前对话里加了一句 → 这边的正文当场多一条', function () {
+    var rowsBefore = sr.querySelectorAll('.row').length;
+    var id = __store.__ds_cur__;
+    var list = cloneStore().map(function (c) {
+      if (c.id !== id) { return c; }
+      c.messages = (c.messages || []).concat([{ mid: 'other-1', role: 'user', show: '另一个窗口说的话', content: '另一个窗口说的话' }]);
+      c.updatedAt = Date.now() + 1000;          // 比这边新，才会被采用
+      return c;
+    });
+    __store.__ds_chats__ = list;
+    fireStorage({ '__ds_chats__': { newValue: list } });
+    var rows = sr.querySelectorAll('.row');
+    var last = rows[rows.length - 1];
+    R.line('气泡数 ' + rowsBefore + ' → ' + rows.length + '   最后一条 = ' + JSON.stringify(last ? last.textContent.slice(0, 24) : null));
+    if (rows.length !== rowsBefore + 1) { throw new Error('没并进来（' + rowsBefore + ' → ' + rows.length + '）'); }
+    if (last.textContent.indexOf('另一个窗口说的话') < 0) { throw new Error('最后一条不是那句话'); }
+  });
+
+  R.t('另一个窗口改了标题 → 抽屉里跟着改名', function () {
+    var id = __store.__ds_cur__;
+    var list = cloneStore().map(function (c) {
+      if (c.id !== id) { return c; }
+      c.title = '别处改的名';
+      c.updatedAt = Date.now() + 2000;
+      return c;
+    });
+    __store.__ds_chats__ = list;
+    fireStorage({ '__ds_chats__': { newValue: list } });
+    var titles = [];
+    sr.querySelectorAll('.hitem .t').forEach(function (n) { titles.push(n.textContent); });
+    R.line('抽屉标题 = ' + JSON.stringify(titles.slice(0, 4)));
+    if (titles.indexOf('别处改的名') < 0) { throw new Error('标题没同步过来'); }
+  });
+
+  R.t('收到自己写入的回声 → 不重复添加、也不重画（否则每轮都会多一份）', function () {
+    var rows = sr.querySelectorAll('.row').length;
+    var items = sr.querySelectorAll('.hitem').length;
+    fireStorage({ '__ds_chats__': { newValue: cloneStore() } });
+    R.line('气泡数 ' + rows + ' → ' + sr.querySelectorAll('.row').length +
+           '   抽屉 ' + items + ' → ' + sr.querySelectorAll('.hitem').length);
+    if (sr.querySelectorAll('.row').length !== rows) { throw new Error('回声把正文搞重复了'); }
+    if (sr.querySelectorAll('.hitem').length !== items) { throw new Error('回声把抽屉搞重复了'); }
+  });
+
+  R.t('另一个窗口删掉正在看的这条 → 这边换一条，不停在一条已经不存在了的对话上', function () {
+    // 先保证存储里至少两条（不然删掉当前的就没别的可换）
+    var list = cloneStore();
+    if (list.length < 2) {
+      list.push({ id: 'other2', title: '另一个窗口建的', updatedAt: Date.now(),
+        messages: [{ mid: 'o2', role: 'user', show: '你好', content: '你好' }] });
+      __store.__ds_chats__ = list;
+      fireStorage({ '__ds_chats__': { newValue: list } });
+    }
+    var id = __store.__ds_cur__;
+    var left = cloneStore().filter(function (c) { return c.id !== id; });
+    __store.__ds_chats__ = left;
+    fireStorage({ '__ds_chats__': { newValue: left } });
+    var on = sr.querySelectorAll('.hitem.on').length;
+    R.line('抽屉 ' + sr.querySelectorAll('.hitem').length + ' 条（存储里 ' + left.length + ' 条）  高亮 ' + on +
+           ' 个   正文气泡 ' + sr.querySelectorAll('.row').length);
+    if (sr.querySelectorAll('.hitem').length !== left.length) { throw new Error('没跟着删掉'); }
+    if (on !== 1) { throw new Error('当前对话没落到别的一条上（高亮 ' + on + ' 个）'); }
+  });
+
+  window.__panelDone = true;        // 这一块后面会往 store 里写 'sk-browser-…'，下一块要等它
+  R.done('面板');
+})();
+</script>
+
+<script>
+// ============ ③ background.js：工具栏图标 → 侧栏；首装没配 Key → 弹设置页 ============
+// 这个文件以前没有任何测试覆盖 —— 它管着"点图标开侧栏"和"第一次装完怎么让人知道要配 Key"，
+// 两条都是用户第一次接触扩展的路径，值得钉住。
+(async function () {
+  var R = mkReport('repC');
+  await wait(80);
+
+  R.t('加载时就设好了"点工具栏图标开侧栏"', function () {
+    R.line('setPanelBehavior 收到 ' + JSON.stringify(panelBehavior));
+    if (!panelBehavior.length) { throw new Error('没调 setPanelBehavior'); }
+    if (panelBehavior[0].openPanelOnActionClick !== true) {
+      throw new Error('openPanelOnActionClick 不是 true → 点图标什么都不会发生');
+    }
+  });
+
+  R.t('onInstalled 上挂了监听（设侧栏行为 + 检查有没有 Key）', function () {
+    R.line('onInstalled 监听数 = ' + installedListeners.length);
+    if (installedListeners.length < 2) { throw new Error('只挂了 ' + installedListeners.length + ' 个'); }
+  });
+
+  delete __store.__ds_key__;               // 模拟"刚装好、还没配 Key"
+  // 等面板那块跑完 —— 它会在 store 里留下 'sk-browser-…'，不等的话这里就验不出"没配 Key"
+  for (var w = 0; w < 250 && !window.__panelDone; w++) { await wait(20); }
+  delete __store.__ds_key__;
+  var b1 = openedOptions;
+  installedListeners.forEach(function (fn) { fn({ reason: 'install' }); });
+  await wait(80);
+  R.t('没配 Key 时装完 → 自动打开设置页', function () {
+    R.line('openOptionsPage：' + b1 + ' → ' + openedOptions);
+    if (openedOptions !== b1 + 1) { throw new Error('没弹设置页，用户只会看到一个"发不出去"的面板'); }
+  });
+
+  __store.__ds_key__ = 'sk-browser-1234567890';   // 已配好
+  var b2 = openedOptions;
+  installedListeners.forEach(function (fn) { fn({ reason: 'update' }); });
+  await wait(80);
+  R.t('已经配好 Key 时 → 不再弹设置页', function () {
+    R.line('openOptionsPage：' + b2 + ' → ' + openedOptions);
+    if (openedOptions !== b2) { throw new Error('配过了还弹，会烦人'); }
+  });
+
+  // 收个尾：把面板关掉再出结果，不然它浮在上面，截图/肉眼都被挡住一块看不到报告
+  try { window.__dsPanel.close(); } catch (e) {}
+
+  R.done('background');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,493 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>panel.js 自检</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #e8eaee; }
+  #report { position: fixed; left: 0; top: 0; right: 0; padding: 10px 14px; z-index: 99999;
+            font: 13px/1.5 system-ui, "Microsoft YaHei", sans-serif; background: #16a34a; color: #fff;
+            white-space: pre-wrap; }
+  #report.bad { background: #dc2626; }
+</style>
+</head>
+<body>
+<div id="report">运行中…</div>
+<div id="report2" style="position:fixed;left:0;bottom:0;right:0;padding:10px 14px;z-index:99998;
+     font:13px/1.5 system-ui,'Microsoft YaHei',sans-serif;background:#185FA5;color:#fff;white-space:pre-wrap">划词测试中…</div>
+<script>
+  // ---- 模拟 content.js 给面板提供的东西 + chrome API ----
+  // 造一条"真实长相"的假对话：表格 + 标题 + 嵌套列表 + 引用 + 代码块。
+  // 这样打开面板就能一眼看出排版对不对（表格以前是原样吐 |---|---| 的）。
+  var TABLE = '| 项 | 内容 |\n|---|----|\n| 强缓存 | 由 Cache-Control 决定，不发请求 |' +
+    '\n| 协商缓存 | 由 ETag 决定，发个问询再定 |\n| 命中缓存 | 直接用本地那份，很快 |' +
+    '\n| 没命中 | 服务器回 304，不用重传正文 |\n| 常见坑 | 改了文件但文件名没变 |';
+  var MD = '## 网页缓存是怎么回事\n\n' + TABLE +
+    '\n\n### 几点建议\n\n- **先给静态资源加指纹**：文件名里带上内容哈希，改了就换名字\n- 再想缓存策略\n  - 页面用 no-cache，资源用长缓存\n- 别在开发环境开长缓存\n\n> 顺便一提：Ctrl+F5 能强制绕开缓存。\n\n' +
+    '这样写就行：\n\n```js\nfetch("/api", { cache: "no-store" });\n```\n\n完事。' +
+    // 「推荐图片」开着时模型会在末尾给这个东西：它不该露在正文里，
+    // 而是变成气泡底部一行可点的小块（这一行也是给人看的效果图）
+    '\n\n<img-reco>HTTP 缓存 流程图 | 浏览器缓存 304 示意图</img-reco>';
+  var __store = {
+    __ds_chats__: [{
+      id: 'test1', title: '测试对话', updatedAt: Date.now(),
+      messages: [
+        { role: 'user', content: '网页缓存是怎么回事', show: '网页缓存是怎么回事' },
+        { role: 'assistant', content: MD, show: MD, reasoning: '概念问题，先给一张对照表，再补几条建议。' }
+      ]
+    }],
+    __ds_cur__: 'test1'
+  };
+  // 剪贴板的桩：无头浏览器里 navigator.clipboard 会直接抛，所以换成记录用的假货，
+  // 这样才验得了"点复制到底写进去了什么"。
+  var clipText = '';
+  try {
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: function (t) { clipText = String(t); return Promise.resolve(); } }
+    });
+  } catch (e) {}
+
+  var getCalls = [];
+  var msgListeners = [];        // panel.js 会注册一个：替侧边栏取本页内容
+  window.chrome = {
+    storage: {
+      local: {
+        get: function (k, cb) { getCalls.push(k); setTimeout(function () { cb(__store); }, 0); },
+        set: function (o, cb) { Object.keys(o).forEach(function (k) { __store[k] = o[k]; }); if (cb) setTimeout(cb, 0); }
+      }
+    },
+    runtime: {
+      sendMessage: function (m, cb) { if (cb) setTimeout(function () { cb({}); }, 0); },
+      onMessage: { addListener: function (fn) { msgListeners.push(fn); } },
+      lastError: null
+    }
+  };
+  window.__DS_BALL = function () { return { x: 300, y: 260, size: 53 }; };   // 假装球在左上
+  window.__DS_BALL_VISIBLE = function () {};
+  window.__DS_ICON_PATH = '';
+
+  var problems = [];
+  // panel.js 里 initData() 的异常是被 .catch() 吞掉再 console.error 的，
+  // 光监听 error 事件看不到，所以这里把 console.error 也接管过来。
+  window.console.error = function () {
+    problems.push('console.error: ' + Array.prototype.slice.call(arguments).join(' '));
+  };
+  window.addEventListener('error', function (e) {
+    problems.push('error: ' + e.message + ' @' + String(e.filename || '').split('/').pop() + ':' + e.lineno);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    problems.push('reject: ' + ((e.reason && e.reason.message) ? e.reason.message : String(e.reason)));
+  });
+</script>
+
+<script src="../config.js"></script>
+<script src="../panel.js"></script>
+<script src="../content.js"></script>
+
+<script>
+  setTimeout(function () {
+    var out = [];
+    var host = null, sr = null;
+    function t(name, fn) {
+      try { fn(); out.push('✓ ' + name); }
+      catch (e) { out.push('✗ ' + name + ' → ' + e.message); }
+    }
+
+    t('panel.js 已加载，__dsPanel 有 open/close', function () {
+      if (!window.__dsPanel) { throw new Error('__dsPanel 没暴露'); }
+      if (typeof window.__dsPanel.open !== 'function') { throw new Error('open 不是函数'); }
+      if (typeof window.__dsPanel.close !== 'function') { throw new Error('close 不是函数'); }
+    });
+
+    t('打开面板', function () {
+      window.__dsPanel.open();
+      host = document.getElementById('__ds_float_panel__');
+      if (!host) { throw new Error('面板节点没建出来'); }
+      sr = host.shadowRoot;
+      if (!sr) { throw new Error('没有 shadowRoot'); }
+    });
+
+    // 打开之后要等一等：open() 里那句 initData() 是异步的（要读存储、再渲染消息），
+    // 紧接着同步断言只会看到空面板 —— 我第一次就是这么被骗了一轮。
+    setTimeout(function () {
+    t('面板进入显示状态（.wrap.in）', function () {
+      if (!sr.querySelector('.wrap.in')) { throw new Error('没有 .wrap.in'); }
+      if (host.style.display === 'none') { throw new Error('host 还是隐藏的'); }
+    });
+
+    t('位置贴着球', function () {
+      // 注意：content.js 也会设 window.__DS_BALL（那就是真球的位置），
+      // 所以这里要读**实际**的球位置来算期望值，不能写死。
+      var b = (typeof window.__DS_BALL === 'function' ? window.__DS_BALL() : null) || { x: 300, y: 260, size: 53 };
+      var l = parseFloat(host.style.left), tp = parseFloat(host.style.top);
+      var w = parseFloat(host.style.width), h = parseFloat(host.style.height);
+      var bx = b.x + b.size / 2, by = b.y + b.size / 2;
+      out.push('   面板 ' + Math.round(l) + ',' + Math.round(tp) + ' ' + w + 'x' + h +
+               '  中心 (' + Math.round(l + w / 2) + ',' + Math.round(tp + h / 2) + ')  球心 (' + bx + ',' + by + ')');
+      var okCenter = Math.abs(l + w / 2 - bx) < 2 && Math.abs(tp + h / 2 - by) < 2;
+      var okClamp = Math.abs(l - 12) < 2 || Math.abs(tp - 12) < 2 ||
+                    Math.abs(l + w - (window.innerWidth - 12)) < 20 ||
+                    Math.abs(tp + h - (window.innerHeight - 12)) < 20;
+      if (!okCenter && !okClamp) { throw new Error('既不居中也没贴边夹取，位置不对'); }
+    });
+
+    t('界面元素齐全', function () {
+      var need = ['#input', '#effort', '#models', '#send', '#page', '#imgprompt', '#grip', '#exit',
+                  '#history', '#del', '#fs', '#list', '.bar', '.toprow', '.tools'];
+      var miss = need.filter(function (s) { return !sr.querySelector(s); });
+      if (miss.length) { throw new Error('少了 ' + miss.join(' ')); }
+    });
+
+    t('输入框上方那行放着「应用网页 + 这是什么？」', function () {
+      var tr = sr.querySelector('.toprow');
+      var ids = Array.prototype.map.call(tr.querySelectorAll('button'), function (b) { return b.id; });
+      if (ids.indexOf('page') < 0 || ids.indexOf('imgprompt') < 0) {
+        throw new Error('toprow 里是 [' + ids.join(',') + ']');
+      }
+      out.push('   toprow 按钮: ' + ids.join(' , '));
+      var tools = Array.prototype.map.call(sr.querySelectorAll('.tools > *'), function (b) {
+        return b.id || b.className;
+      });
+      out.push('   工具条: ' + tools.join(' , '));
+    });
+
+    t('思考强度下拉有 4 档', function () {
+      var e = sr.querySelector('#effort');
+      var labels = Array.prototype.map.call(e.options, function (o) { return o.textContent + '=' + o.value; });
+      if (labels.length < 2) { throw new Error('只有 ' + labels.length + ' 个'); }
+      out.push('   ' + labels.join('  '));
+    });
+
+    t('模型下拉有内容', function () {
+      var m = sr.querySelector('#models');
+      var labels = Array.prototype.map.call(m.options, function (o) { return o.textContent; });
+      if (!labels.length) { throw new Error('空的'); }
+      out.push('   ' + labels.join('  '));
+    });
+
+    t('假对话渲染出来了', function () {
+      out.push('   .row = ' + sr.querySelectorAll('.row').length +
+               '，.empty = ' + !!sr.querySelector('.empty') +
+               '，.list 子元素 = ' + sr.querySelectorAll('.list > *').length);
+      out.push('   store 里的键 = ' + Object.keys(__store).join(','));
+      out.push('   storage.get 被调用 ' + getCalls.length + ' 次：' + getCalls.join(' '));
+      if (!sr.querySelectorAll('.row').length) { throw new Error('消息一条都没渲染'); }
+    });
+
+    t('表格渲染成真 table（不是 |---|---| 原文）', function () {
+      var tb = sr.querySelector('.tablewrap table');
+      var ths = sr.querySelectorAll('.tablewrap th').length;
+      var tds = sr.querySelectorAll('.tablewrap td').length;
+      out.push('   table=' + !!tb + '  表头格=' + ths + '  数据格=' + tds);
+      if (!tb) { throw new Error('没渲染出 table'); }
+      if (ths !== 2) { throw new Error('表头格数不对（应为 2）'); }
+      if (sr.querySelector('.body').textContent.indexOf('|---|') >= 0) { throw new Error('分隔行还露在正文里'); }
+    });
+
+    t('标题、嵌套列表、引用都渲染了', function () {
+      // 注意：别用 sr.querySelector('.body') —— 那拿到的是**第一条**消息（用户那句），
+      // 我们要查的是最后一条（AI 的回答）。
+      var bodies = sr.querySelectorAll('.body');
+      var ai = bodies[bodies.length - 1];
+      var h = ai.querySelectorAll('h1,h2,h3,h4').length;
+      var li = ai.querySelectorAll('li').length;
+      var nested = ai.querySelectorAll('li ul, li ol').length;
+      out.push('   回答里的标题元素=' + h + '  列表项=' + li + '  嵌套列表=' + nested +
+               '  引用=' + ai.querySelectorAll('blockquote').length);
+      if (!h) { throw new Error('没有标题元素'); }
+      if (li < 4) { throw new Error('列表项太少，可能没解析成列表'); }
+      if (!nested) { throw new Error('嵌套那层没渲染出来'); }
+      if (!ai.querySelector('blockquote')) { throw new Error('引用没渲染'); }
+      if (ai.textContent.indexOf('## ') >= 0) { throw new Error('井号还露在正文里'); }
+      if (ai.textContent.indexOf('- **先给静态资源加指纹**') >= 0) { throw new Error('列表标记还露在正文里'); }
+    });
+
+    t('回答右上角有复制按钮', function () {
+      var n = sr.querySelectorAll('.cp-msg').length;
+      out.push('   回答级复制按钮 ' + n + ' 个');
+      if (!n) { throw new Error('一条都没有'); }
+    });
+
+    t('代码块有复制按钮，且能取到代码原文', function () {
+      var code = sr.querySelector('.codewrap code');
+      var n = sr.querySelectorAll('.codewrap .cp-code').length;
+      out.push('   代码块按钮 ' + n + ' 个，取到的代码 = ' + JSON.stringify(code ? code.textContent : null));
+      if (!code) { throw new Error('没有 .codewrap code'); }
+      if (code.textContent.indexOf('no-store') < 0) { throw new Error('取到的不是代码原文'); }
+    });
+
+    t('点代码块的复制按钮不报错', function () {
+      var c = sr.querySelector('.codewrap .cp-code');
+      c.click();
+      out.push('   点完按钮文字 = ' + c.textContent + '（剪贴板在无头浏览器里多半被拒，只要不抛异常就算过）');
+    });
+
+    // 回答级那个「复制」：把 navigator.clipboard 换成桩，看它到底写了什么进去。
+    // 这才是真正要验的东西 —— 复制出去的是"人能读的纯文本"，不是 markdown 原文。
+    t('点回答级「复制」→ 拿到的是纯文本（没有 |---| 和 **）', function () {
+      var b = sr.querySelector('.cp-msg');
+      if (!b) { throw new Error('没有回答级复制按钮'); }
+      b.click();
+      out.push('   剪贴板内容 = ' + JSON.stringify(clipText.slice(0, 150)));
+      if (!clipText) { throw new Error('没写进剪贴板（桩没接住？）'); }
+      if (clipText.indexOf('|---|') >= 0) { throw new Error('表格分隔行还在'); }
+      if (clipText.indexOf('|') >= 0) { throw new Error('表格竖线还在'); }
+      if (clipText.indexOf('**') >= 0) { throw new Error('加粗星号还在'); }
+      if (clipText.indexOf('##') >= 0) { throw new Error('标题井号还在'); }
+      if (clipText.indexOf('项') < 0 || clipText.indexOf('内容') < 0) { throw new Error('表格内容丢了'); }
+      if (clipText.indexOf('no-store') < 0) { throw new Error('代码块内容丢了'); }
+      if (clipText.indexOf('加指纹') < 0) { throw new Error('列表内容丢了'); }
+      out.push('   首行 = ' + JSON.stringify(clipText.split('\n')[0]));
+    });
+
+    // 侧边栏里点「应用网页」时，会发消息来问本页的内容 —— 这里验网页侧真的会答，
+    // 而且字段和侧栏那边要的**一致**（这就是两侧之间的契约，改一边要改另一边）。
+    t('网页侧会应答"取本页内容"（侧栏靠这个读网页）', function () {
+      if (!msgListeners.length) { throw new Error('panel.js 没注册消息监听'); }
+      var got = null;
+      msgListeners.forEach(function (fn) {
+        fn({ type: 'ds-grab-page' }, {}, function (r) { got = r; });
+      });
+      if (!got) { throw new Error('没有回应'); }
+      out.push('   回了: ok=' + got.ok + '  title=' + JSON.stringify(got.title) +
+               '  正文=' + (got.text || '').length + ' 字  可见文字=' + (got.visible || '').length +
+               ' 字  图片=' + (got.images || []).length + ' 张');
+      if (!got.ok) { throw new Error('ok=false：' + got.error); }
+      if (!(got.text || '').length) { throw new Error('没取到正文'); }
+      if (typeof got.visible !== 'string') { throw new Error('visible 字段不对'); }
+      if (!Array.isArray(got.images)) { throw new Error('images 不是数组'); }
+    });
+
+    t('代码块包在 .codewrap 里，按钮不随横向滚动跑', function () {
+      var pre = sr.querySelector('.codewrap pre');
+      if (!pre) { throw new Error('pre 没包进 codewrap'); }
+      var pos = getComputedStyle(sr.querySelector('.codewrap')).position;
+      out.push('   .codewrap position = ' + pos);
+      if (pos !== 'relative') { throw new Error('不是 relative，按钮定位会跑偏'); }
+    });
+
+    t('关闭面板后球该回来', function () {
+      var back = false;
+      var old = window.__DS_BALL_VISIBLE;
+      window.__DS_BALL_VISIBLE = function (v) { if (v === true) { back = true; } };
+      window.__dsPanel.close();
+      window.__DS_BALL_VISIBLE = old;
+      if (!back) { throw new Error('关面板没有通知球回来'); }
+      if (host.style.display !== 'none') { throw new Error('host 没有隐藏'); }
+    });
+
+    if (problems.length) {
+      out.push('');
+      out.push('⚠ 运行中捕获到：');
+      problems.forEach(function (p) { out.push('   ' + p); });
+    }
+    var bad = out.filter(function (x) { return x.indexOf('✗') === 0; }).length;
+    var d = document.getElementById('report');
+    d.className = (bad || problems.length) ? 'bad' : '';
+    d.textContent = (bad || problems.length ? '发现问题 ' + (bad + problems.length) + ' 处' : '全部通过 ✓') + '\n' + out.join('\n');
+    }, 400);          // 内层：等 initData() 那种异步动作跑完
+  }, 400);            // 外层：等脚本都就位
+</script>
+
+<script>
+  // ---- 划词提问的独立测试 ----
+  // 单独一段：它要造真实的选区、等 content.js 的 mouseup 处理，节奏跟上面的面板测试不一样。
+  setTimeout(function () {
+    var out2 = [];
+    function t2(name, fn) {
+      try { fn(); out2.push('✓ ' + name); }
+      catch (e) { out2.push('✗ ' + name + ' → ' + e.message); }
+    }
+    function report2() {
+      var bad2 = out2.filter(function (x) { return x.indexOf('✗') === 0; }).length;
+      var d2 = document.getElementById('report2');
+      d2.style.background = bad2 ? '#dc2626' : '#0F6E56';
+      d2.textContent = (bad2 ? '划词提问：发现 ' + bad2 + ' 处问题' : '划词提问：全部通过 ✓') + '\n' + out2.join('\n');
+    }
+
+    t2('content.js 把球注入了', function () {
+      if (!document.getElementById('__ds_float_ball__')) { throw new Error('没有 #__ds_float_ball__'); }
+    });
+
+    // 造一段文字并"选中"它，再发一个 mouseup（content.js 就是靠这个触发的）
+    var para = document.createElement('p');
+    para.textContent = '选中我试试划词提问';
+    para.style.cssText = 'position:absolute;left:30px;top:150px;font-size:16px;color:#333';
+    document.body.appendChild(para);
+    var range = document.createRange();
+    range.selectNodeContents(para);
+    var sel = window.getSelection();
+    function sel2() {                       // 重新选中那段字（每步之间选区可能被清掉）
+      var r = document.createRange();
+      r.selectNodeContents(para);
+      var s = window.getSelection();
+      s.removeAllRanges();
+      s.addRange(r);
+    }
+    sel.removeAllRanges();
+    sel.addRange(range);
+    document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+    setTimeout(function () {
+      var ballHost = document.getElementById('__ds_float_ball__');
+      var btn = ballHost ? ballHost.shadowRoot.querySelector('.selbtn') : null;   // 第一颗 = 问 X
+      var bar = ballHost ? ballHost.shadowRoot.querySelector('.selbar') : null;   // 整行菜单
+      var allBtns = ballHost ? ballHost.shadowRoot.querySelectorAll('.selbtn') : [];
+
+      t2('选中网页文字会冒出一行快捷动作', function () {
+        if (!btn || !bar) { throw new Error('没有 .selbar / .selbtn'); }
+        var labels = Array.prototype.map.call(allBtns, function (b) { return b.textContent; });
+        out2.push('   菜单 = ' + JSON.stringify(labels));
+        out2.push('   display=' + bar.style.display + '  位置=' + bar.style.left + ',' + bar.style.top);
+        if (bar.style.display === 'none') { throw new Error('菜单没显形'); }
+        if (allBtns.length < 2) { throw new Error('只有一颗，快捷动作没有生效'); }
+        if (labels[0].indexOf('问 ') !== 0) { throw new Error('第一颗应该是「问 X」，实际 ' + labels[0]); }
+      });
+
+      // 用**真实的鼠标序列**点它（mousedown → mouseup → click）。
+      // 之前这里写的是 btn.click()，那只发 click、不发 mousedown，
+      // 于是"按下时按钮会不会被自己藏掉"这条完全没测到 —— 真机上的 bug 就是这么漏掉的。
+      var seen = [];
+      document.addEventListener('mousedown', function (e) {
+        var path = e.composedPath ? e.composedPath() : [];
+        seen.push('document 看到: target=' + (e.target && (e.target.id || e.target.tagName)) +
+                  ' path[0]=' + (path[0] && (path[0].className || path[0].tagName)));
+      }, true);
+
+      t2('按钮真的能被鼠标"碰到"（命中测试，不是靠合成事件）', function () {
+        if (!btn) { throw new Error('跳过（上一条没通过）'); }
+        sel2();
+        if (typeof ballHost.shadowRoot.elementFromPoint !== 'function') {
+          out2.push('   这个 Chrome 没有 shadowRoot.elementFromPoint，跳过');
+          return;
+        }
+        var r = btn.getBoundingClientRect();
+        var hit = ballHost.shadowRoot.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+        out2.push('   按钮矩形 ' + Math.round(r.left) + ',' + Math.round(r.top) + ' ' +
+                  Math.round(r.width) + 'x' + Math.round(r.height) +
+                  '  该点命中的是 = ' + (hit ? (hit.className || hit.tagName) : 'null'));
+        if (hit !== btn) { throw new Error('按钮那一点上命中的不是它自己 → 真鼠标点不到'); }
+      });
+
+      t2('按下时按钮不能被藏掉（真鼠标序列）', function () {
+        if (!btn) { throw new Error('跳过（上一条没通过）'); }
+        sel2();
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+        out2.push('   ' + seen.join(' | '));
+        out2.push('   按下后 bar.display=' + (bar ? bar.style.display : '?'));
+        if (bar && bar.style.display === 'none') { throw new Error('一按下整行菜单就消失了 → 后面不可能点到'); }
+      });
+
+      t2('完整按一下 → 变成一枚蓝色 chip，输入框保持干净', function () {
+        if (!btn) { throw new Error('跳过（上一条没通过）'); }
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true }));
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+        var ph = document.getElementById('__ds_float_panel__');
+        var input = ph && ph.shadowRoot.querySelector('#input');
+        var chips = ph ? Array.prototype.map.call(ph.shadowRoot.querySelectorAll('.chip'), function (c) {
+          return c.textContent.replace(/\s+/g, ' ').trim();
+        }) : [];
+        out2.push('   输入框 = ' + JSON.stringify(input ? input.value : null));
+        out2.push('   chips = ' + JSON.stringify(chips));
+        if (!input) { throw new Error('面板不在'); }
+        if (input.value) { throw new Error('把正文灌进输入框了（要挂成 chip）'); }
+        if (!chips.some(function (n) { return n.indexOf('问 Nova') === 0 && n.indexOf('字') > 0; })) {
+          throw new Error('没有出现「问 Nova · N 字」的 chip');
+        }
+      });
+
+      // 先把已经挂上的 chip 都撤掉（点它自己的 ×），这样下面的计数才干净
+      function clearChips() {
+        var ph = document.getElementById('__ds_float_panel__');
+        if (!ph) { return; }
+        var xs = ph.shadowRoot.querySelectorAll('.chip button');
+        Array.prototype.forEach.call(xs, function (x) { x.click(); });
+      }
+
+      t2('同一段文字 + 同一个动作点两次 → 不重复挂（手快点了两下不会两枚）', function () {
+        if (!btn) { throw new Error('跳过（上一条没通过）'); }
+        var ph = document.getElementById('__ds_float_panel__');
+        var n0 = ph.shadowRoot.querySelectorAll('.chip').length;
+        sel2();
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true }));
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+        var n1 = ph.shadowRoot.querySelectorAll('.chip').length;
+        out2.push('   再点一次：chips ' + n0 + ' → ' + n1);
+        out2.push('   提示 = ' + JSON.stringify(ph.shadowRoot.querySelector('#toast').textContent));
+        if (n1 !== n0) { throw new Error('重复挂了同一段'); }
+      });
+
+      t2('选区在点击前被清掉，也照样能挂上（缓存兜底）', function () {
+        if (!btn) { throw new Error('跳过（上一条没通过）'); }
+        var ph = document.getElementById('__ds_float_panel__');
+        clearChips();
+        var chipsBefore = ph.shadowRoot.querySelectorAll('.chip').length;
+        window.getSelection().removeAllRanges();     // 模拟"网站把选区清了"
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true }));
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+        var chipsAfter = ph.shadowRoot.querySelectorAll('.chip').length;
+        out2.push('   清空后 chips ' + chipsBefore + ' → ' + chipsAfter);
+        if (chipsAfter !== chipsBefore + 1) { throw new Error('选区没了就挂不上'); }
+      });
+
+      // 快捷动作：点「翻译」→ 应该是"提示词 + 选区"打包成 chip，输入框还是空的，而且**不自动发送**
+      t2('点「翻译」→ chip 上写「翻译 · N 字」，输入框不被灌，也不自动发送', function () {
+        if (!bar) { throw new Error('跳过（没有菜单）'); }
+        var ph = document.getElementById('__ds_float_panel__');
+        var input = ph && ph.shadowRoot.querySelector('#input');
+        if (!input) { throw new Error('面板不在'); }
+        var tr = null;
+        Array.prototype.forEach.call(allBtns, function (b) { if (b.textContent === '翻译') { tr = b; } });
+        if (!tr) { throw new Error('菜单里没有「翻译」这颗'); }
+        input.value = '';
+        var rowsBefore = ph.shadowRoot.querySelectorAll('.row').length;
+        sel2();                                     // 重新选中那段字
+        tr.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, composed: true, cancelable: true }));
+        tr.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, composed: true }));
+        tr.dispatchEvent(new MouseEvent('click', { bubbles: true, composed: true }));
+        var chips = Array.prototype.map.call(ph.shadowRoot.querySelectorAll('.chip'), function (c) {
+          return c.textContent.replace(/\s+/g, ' ').trim();
+        });
+        out2.push('   chips = ' + JSON.stringify(chips));
+        out2.push('   输入框 = ' + JSON.stringify(input.value) +
+                  '   气泡数 ' + rowsBefore + ' → ' + ph.shadowRoot.querySelectorAll('.row').length);
+        if (!chips.some(function (n) { return n.indexOf('翻译 ·') === 0; })) { throw new Error('没有「翻译」chip'); }
+        if (input.value) { throw new Error('输入框被灌了提示词，用户就没法写自己的问题了'); }
+        if (ph.shadowRoot.querySelectorAll('.row').length !== rowsBefore) { throw new Error('自动发送了，用户没机会改'); }
+      });
+
+      // 反过来：在面板自己里面选字，不该弹这个按钮
+      try {
+        var ph2 = document.getElementById('__ds_float_panel__');
+        var tt = ph2 && ph2.shadowRoot.querySelector('.tt');
+        if (tt) {
+          var r2 = document.createRange();
+          r2.selectNodeContents(tt);
+          var s2 = window.getSelection();
+          s2.removeAllRanges();
+          s2.addRange(r2);
+          document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        }
+      } catch (e) {}
+
+      setTimeout(function () {
+        t2('面板里选字不会弹这行菜单', function () {
+          if (bar && bar.style.display !== 'none') { throw new Error('在面板里选字也弹了，会干扰编辑'); }
+        });
+        report2();
+        // 留一张"菜单长什么样"的定格：重新选中那段字、再发一次 mouseup（等 selMute 过了）
+        setTimeout(function () {
+          try {
+            sel2();
+            document.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+          } catch (e) {}
+        }, 480);
+      }, 150);
+    }, 150);
+  }, 1500);
+</script>
+</body>
+</html>

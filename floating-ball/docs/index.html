@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepSeek 悬浮球 · 效果一览</title>
+<style>
+  :root{
+    --bg:#f4f5f7; --card:#fff; --ink:#1b1d20; --dim:#6a7076; --line:#e6e8ec; --blue:#4D6BFE;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:15px/1.7 "Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;
+    padding:40px 24px 72px;
+  }
+  .page{max-width:980px;margin:0 auto}
+  header{margin-bottom:34px}
+  h1{font-size:26px;font-weight:600;letter-spacing:.2px}
+  h1 span{color:var(--blue)}
+  .sub{color:var(--dim);margin-top:8px;font-size:14px}
+  .steps{
+    display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+    gap:12px;margin:26px 0 34px;
+  }
+  .step{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .step b{display:block;font-size:13px;color:var(--blue);margin-bottom:4px}
+  .step code{
+    font:12.5px/1.6 ui-monospace,Consolas,monospace;background:#f0f2f6;
+    padding:1px 5px;border-radius:5px;word-break:break-all;
+  }
+  h2{font-size:15px;font-weight:600;color:var(--dim);margin:34px 0 14px;letter-spacing:.4px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+  figure{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden;
+    box-shadow:0 2px 10px rgba(20,25,40,.05)}
+  figure img{display:block;width:100%;height:auto;border-bottom:1px solid var(--line);background:#eceef2}
+  figcaption{padding:11px 14px 13px}
+  figcaption b{font-size:13.5px;font-weight:600}
+  figcaption p{font-size:12.5px;color:var(--dim);margin-top:3px}
+  .wide{grid-column:1/-1}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);
+    border-radius:12px;overflow:hidden;font-size:13.5px}
+  th,td{padding:9px 14px;text-align:left;border-bottom:1px solid var(--line)}
+  tr:last-child td{border-bottom:0}
+  th{background:#fafbfc;color:var(--dim);font-weight:500;font-size:12.5px}
+  td code{font:12.5px/1.6 ui-monospace,Consolas,monospace;background:#f0f2f6;padding:1px 5px;border-radius:5px}
+  .tip{margin-top:14px;font-size:12.5px;color:var(--dim)}
+  footer{margin-top:40px;font-size:12.5px;color:var(--dim);border-top:1px solid var(--line);padding-top:16px}
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header>
+    <h1>DeepSeek 悬浮球 <span>· 效果一览</span></h1>
+    <p class="sub">Chrome 扩展（Manifest V3）。一个能拖动、带惯性的鲸鱼小球，双击开对话面板，读网页、看图、拖文件进来直接问。</p>
+  </header>
+
+  <div class="steps">
+    <div class="step"><b>① 加载扩展</b>打开 <code>chrome://extensions</code>，开启开发者模式，点「加载已解压的扩展程序」，选 <code>floating-ball</code> 这个文件夹（就是你 clone / 解压出来的那个）</div>
+    <div class="step"><b>② 配 API Key</b>面板右上角 <code>⚙</code>（或扩展详情页的「扩展选项」）打开设置页，把 key 粘进去点保存。<b>代码里不写 key。</b></div>
+    <div class="step"><b>③ 刷新</b>在扩展页点本扩展的刷新按钮，再到任意网页按 <code>F5</code>。球会出现在窗口右侧、屏幕高度约 60% 的位置。</div>
+  </div>
+
+  <h2>效果图</h2>
+  <div class="grid">
+    <figure>
+      <img src="shots/ball.png" alt="悬浮球">
+      <figcaption><b>悬浮球本体</b><p>DeepSeek 鲸鱼 + 品牌蓝。拖动跟手，松手带惯性，鼠标碰到放大到 1.15 倍，用力丢向边缘会被吸住、弹三次贴边。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel.png" alt="对话面板">
+      <figcaption><b>对话面板</b><p>双击球打开。左上历史记录，右上 ¥ 查余额 + ⚙ 设置 + 删除，输入框上方三个功能按钮（应用网页 / 这是什么？/ 推荐图片），底部附件 + 思考强度 + 模型选择，流式吐字。<b>开着「推荐图片」时回答末尾会多一行可点的配图搜索词</b>（下面自检页那张图里就有）。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/sidepanel.png" alt="侧边栏">
+      <figcaption><b>侧边栏</b><p>新标签页、设置页、内置 PDF 阅读器这些球进不去的地方，点一下工具栏图标就能聊：右侧开一条栏，切标签页也不关。同一份面板代码，只是铺满整栏。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="panel-format.png" alt="答案排版">
+      <figcaption><b>答案排版</b><p>模型答的 markdown 会真的渲染出来：表格、标题、有序/无序列表（含嵌套）、引用、代码块。不渲染的话表格会原样显示成 <code>|---|---|</code>。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-page-context.png" alt="应用网页">
+      <figcaption><b>应用网页</b><p>让对话读当前页面：整页正文 + 图片，或只读屏幕可见区（含一张真实截图）。发送那一刻才抓取。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-image-prompt.png" alt="快捷提示词">
+      <figcaption><b>快捷提示词</b><p>输入框上方那一行里可点的小按钮，点一下把「这是什么？」填进输入框，再点一下收回去。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-resize.png" alt="拉角缩放">
+      <figcaption><b>拉角改大小</b><p>拖右下角斜纹拉手缩放，尺寸记得住（下次打开还是这套）；按住顶栏也能挪位置，但面板位置每次按球重算 —— 它是"跟着球出现"的。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-fullscreen.png" alt="全屏模式">
+      <figcaption><b>全屏模式</b><p>右上角 ⛶ 铺满整个视口，方便读长回答；再点一下回到原样，Esc 先退全屏。</p></figcaption>
+    </figure>
+  </div>
+
+  <h2>文件角色</h2>
+  <table>
+    <tr><th>文件</th><th>作用</th></tr>
+    <tr><td><code>manifest.json</code></td><td>清单：名称、图标、权限、脚本注入规则、设置页入口</td></tr>
+    <tr><td><code>config.js</code></td><td><b>你要动的文件</b>：模型列表、思考档位、界面人设（<b>API Key 不在这儿</b>）</td></tr>
+    <tr><td><code>options.html</code> + <code>options.js</code></td><td>设置页：<b>API Key 在这儿配</b>，存在浏览器里，代码里不留</td></tr>
+    <tr><td><code>panel.js</code></td><td>对话面板：界面、历史记录、流式请求、读网页、附件、取 Key</td></tr>
+    <tr><td><code>content.js</code></td><td>悬浮球本体：拖动、惯性、吸附、双击开面板、接收拖拽</td></tr>
+    <tr><td><code>sidepanel.html</code> + <code>sidepanel.js</code></td><td>侧边栏入口：点工具栏图标，右侧栏里跑同一个面板</td></tr>
+    <tr><td><code>background.js</code></td><td>后台脚本，三件事：截图、工具栏图标开侧栏、首装提醒配 Key</td></tr>
+    <tr><td><code>icons/</code></td><td>工具栏图标 16 / 48 / 128</td></tr>
+    <tr><td><code>README.md</code></td><td>完整说明文档（安装、参数、实现细节）</td></tr>
+    <tr><td><code>docs/</code></td><td>本页 + 截图 + 三个自检页 + 图标源文件，<b>不影响运行，可整包删除</b></td></tr>
+  </table>
+  <p class="tip">只有上面 9 个文件加 <code>icons/</code> 是运行必需的。要打包上架，`README.md` 和 `docs/` 可以先排除。</p>
+
+  <footer>截图由无头 Chrome 实测生成，不是设计稿。</footer>
+</div>
+</body>
+</html>

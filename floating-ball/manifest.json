@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek 悬浮球",
+  "version": "3.6",
+  "description": "可拖动的 DeepSeek 悬浮球：拖动有惯性、鼠标碰到放大、用力丢向边缘会吸住；双击开对话面板，把文件或文字拖到球上直接开小窗提问。API Key 在设置页里配，代码里没有。",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": ["storage", "sidePanel"],
+  "host_permissions": [
+    "https://api.deepseek.com/*",
+    "<all_urls>"
+  ],
+  "action": {
+    "default_title": "打开 DeepSeek 对话（右侧栏）"
+  },
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["config.js", "panel.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

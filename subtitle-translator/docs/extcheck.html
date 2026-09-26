@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>扩展加载检查</title>
+<style>
+  body { margin:0; padding:24px; background:#f4f4f1; color:#23231f;
+         font-family: system-ui, "Microsoft YaHei", sans-serif; }
+  h1 { font-size:17px; margin:0 0 14px; }
+  .row { font-family: ui-monospace, Consolas, monospace; font-size:14px; font-weight:600;
+         padding:10px 14px; border-radius:8px; margin-bottom:8px; }
+  .pass { background:#eaf3de; color:#27500a; }
+  .fail { background:#fcebeb; color:#791f1f; }
+  #banner { font-size:17px; font-weight:700; padding:14px 18px; border-radius:10px; margin-bottom:16px;
+            background:#f1efe8; color:#444441; }
+  #banner.good { background:#eaf3de; color:#27500a; border:2px solid #639922; }
+  #banner.bad  { background:#fcebeb; color:#791f1f; border:2px solid #e24b4a; }
+  .note { color:#6b6a63; font-size:12px; margin-top:18px; line-height:1.7; }
+  video { position:fixed; right:12px; bottom:12px; width:260px; height:146px; background:#111; }
+</style>
+</head>
+<body>
+<h1>扩展加载检查</h1>
+<div id="banner">等待扩展注入…</div>
+<div id="rows"></div>
+<p class="note">
+  这个页面必须在**装了这个扩展的 Chrome**里打开。它只回答一件事：装上以后，
+  两个世界的脚本有没有真的注入进来、有没有把页面自己的 fetch 弄坏。
+  如果横幅一直是灰的，说明扩展没装上，或者没拿到这个站点的注入权限。
+</p>
+
+<video id="v"></video>
+
+<script>
+var rows = document.getElementById('rows');
+var results = [];
+function add(name, pass, detail) {
+  results.push({ name: name, pass: !!pass });
+  var d = document.createElement('div');
+  d.className = 'row ' + (pass ? 'pass' : 'fail');
+  d.textContent = (pass ? 'PASS  ' : 'FAIL  ') + name + (detail ? '   → ' + detail : '');
+  rows.appendChild(d);
+}
+
+function finish() {
+  var failed = results.filter(function (r) { return !r.pass; }).length;
+  var b = document.getElementById('banner');
+  b.className = failed ? 'bad' : 'good';
+  b.textContent = (failed ? '有 ' + failed + ' 项没过' : '扩展注入正常') +
+    '  ·  ' + (results.length - failed) + '/' + results.length;
+  document.title = failed ? ('FAIL ' + failed) : 'EXTOK';
+}
+
+function report() {
+  var capOk = window.__dssub_capture_installed === true;
+  var host = document.getElementById('__dssub_overlay_host__');
+
+  add('MAIN world 抓取脚本已注入', capOk, String(window.__dssub_capture_installed));
+  add('隔离世界内容脚本已注入（覆盖层宿主存在）', !!host);
+  add('内容脚本认出了页面里的视频', !!host && !!(host.shadowRoot) &&
+      !!host.shadowRoot.querySelector('.wrap'));
+
+  fetch('sample.vtt').then(function (r) { return r.text(); }).then(function (t) {
+    add('抓取脚本没有弄坏页面自己的 fetch', t.indexOf('WEBVTT') === 0, t.slice(0, 10));
+    finish();
+  }).catch(function (e) {
+    add('抓取脚本没有弄坏页面自己的 fetch', false, String(e && e.message));
+    finish();
+  });
+}
+
+var tries = 0;
+var timer = setInterval(function () {
+  tries++;
+  var ok = window.__dssub_capture_installed === true;
+  var host = document.getElementById('__dssub_overlay_host__');
+  if ((ok && host) || tries >= 60) {
+    clearInterval(timer);
+    report();
+  }
+}, 150);
+</script>
+</body>
+</html>

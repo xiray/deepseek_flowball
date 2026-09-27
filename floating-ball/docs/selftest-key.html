@@ -42,6 +42,25 @@ var openedOptions = 0;            // chrome.runtime.openOptionsPage 被调了几
 var msgListeners = [];
 var installedListeners = [];      // background.js 注册的 onInstalled
 var panelBehavior = [];           // sidePanel.setPanelBehavior 收到的参数
+var shortcutList = [
+  { name: 'toggle-panel', shortcut: 'Alt+Space', description: '打开 / 收起对话面板' },
+  { name: 'ask-selection', shortcut: 'Alt+Q', description: '把选中的文字送进面板' }
+];
+var createdTabs = [];             // chrome.tabs.create 收到的地址（"去改快捷键"那颗按钮）
+var sidePanelOpens = [];          // sidePanel.open 收到的参数（快捷键的兜底路径）
+var commandListeners = [];        // background.js 注册的 onCommand
+var tabMessages = [];             // 后台发给页面的消息
+var sendMessageFails = false;     // true = 模拟"页面里没人接"（chrome:// 这类页面）
+var tabQueryResult = [{ id: 7, windowId: 3 }];
+function toggleMsgs() {           // 只看快捷键那条，别的（抓页面）不掺和
+  return tabMessages.filter(function (x) { return x.msg && x.msg.type === 'ds-toggle-panel'; });
+}
+// 模拟"后台把消息发到页面"：面板在 onMessage 上注册的监听会被真的调起来
+function fireRuntimeMessage(m) {
+  var out = null;
+  msgListeners.forEach(function (fn) { fn(m, { id: 'test-extension-id' }, function (r) { out = r; }); });
+  return out;
+}
 window.chrome = {
   storage: {
     local: {
@@ -55,7 +74,26 @@ window.chrome = {
     onChanged: { addListener: function (fn) { storageListeners.push(fn); } }
   },
   sidePanel: {
-    setPanelBehavior: function (o) { panelBehavior.push(o); return Promise.resolve(); }
+    setPanelBehavior: function (o) { panelBehavior.push(o); return Promise.resolve(); },
+    open: function (o) { sidePanelOpens.push(o || {}); return Promise.resolve(); }
+  },
+  commands: {
+    getAll: function (cb) { setTimeout(function () { cb(shortcutList); }, 0); },
+    onCommand: { addListener: function (fn) { commandListeners.push(fn); } }
+  },
+  tabs: {
+    create: function (o) { createdTabs.push(o && o.url); },
+    query: function (q, cb) { setTimeout(function () { cb(tabQueryResult); }, 0); },
+    sendMessage: function (id, m, cb) {
+      tabMessages.push({ id: id, msg: m });
+      setTimeout(function () {
+        if (sendMessageFails) {                 // 页面里没人接
+          chrome.runtime.lastError = { message: 'Could not establish connection. Receiving end does not exist.' };
+          if (cb) { cb(); }
+          chrome.runtime.lastError = null;
+        } else if (cb) { cb({ ok: true }); }
+      }, 0);
+    }
   },
   runtime: {
     id: 'test-extension-id',      // ctxAlive() 要有它，否则面板会以为扩展上下文失效了
@@ -214,6 +252,55 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     R.line('当前状态行：' + els.cur.textContent);
     if ('__ds_key__' in __store) { throw new Error('清空没生效'); }
     if (els.cur.textContent.indexOf('还没配') < 0) { throw new Error('没告诉用户当前没配'); }
+  });
+
+  // ---- 唤起快捷键那块 ----
+  await opt.refresh();                       // 快捷键是在 refresh() 里读的
+  R.t('设置页有「唤起快捷键」，显示当前绑的键（读 chrome.commands.getAll）', function () {
+    var now = els.keyNow;
+    R.line('显示 = ' + JSON.stringify(now && now.textContent));
+    if (!now) { throw new Error('没有那一行'); }
+    if (now.textContent.indexOf('Alt') < 0) { throw new Error('没显示当前快捷键'); }
+    if (now.textContent.indexOf('空格') < 0) { throw new Error('Space 没翻成"空格"，用户看不懂'); }
+  });
+
+  R.t('点「去改快捷键」→ 打开 Chrome 的快捷键页（扩展自己改不了，只能给入口）', function () {
+    var before = createdTabs.length;
+    els.keys.click();
+    R.line('打开 = ' + JSON.stringify(createdTabs.slice(before)) + '   提示 = ' + JSON.stringify(els.keySt.textContent));
+    if (createdTabs.length !== before + 1) { throw new Error('没打开'); }
+    if (String(createdTabs[createdTabs.length - 1]).indexOf('chrome://extensions/shortcuts') !== 0) {
+      throw new Error('地址不对：' + createdTabs[createdTabs.length - 1]);
+    }
+  });
+
+  R.t('设置页把两条快捷键都列出来（开合面板 / 送选中的文字）', function () {
+    var t = els.keyNow.textContent;
+    R.line('显示 = ' + JSON.stringify(t));
+    if (t.indexOf('面板') < 0) { throw new Error('没列"开 / 收面板"那条'); }
+    if (t.indexOf('选中') < 0) { throw new Error('没列"把选中的文字送进面板"那条'); }
+    if (t.indexOf('Alt + Q') < 0) { throw new Error('没显示第二条的键位'); }
+  });
+
+  R.t('键名翻成人话（Space → 空格、Comma → 逗号），空值还是空', function () {
+    R.line('Alt+Space → ' + JSON.stringify(opt.keyLabel('Alt+Space')) +
+           '   Ctrl+Shift+Comma → ' + JSON.stringify(opt.keyLabel('Ctrl+Shift+Comma')) +
+           '   空 → ' + JSON.stringify(opt.keyLabel('')));
+    if (opt.keyLabel('Alt+Space') !== 'Alt + 空格') { throw new Error('Alt+Space 翻错了'); }
+    if (opt.keyLabel('Ctrl+Shift+Comma') !== 'Ctrl + Shift + 逗号') { throw new Error('Comma 翻错了'); }
+    if (opt.keyLabel('') !== '') { throw new Error('空值应该还是空'); }
+  });
+
+  var keepCommands = chrome.commands;
+  chrome.commands = undefined;                // 老环境没有这个 API
+  var noCmdSc = await opt.syncKeys();
+  var noCmdText = els.keyNow.textContent;
+  chrome.commands = keepCommands;
+  await opt.refresh();
+  R.t('读不到快捷键（老环境 / 没有 commands）→ 不炸，说一句"读不到"', function () {
+    R.line('读到 = ' + JSON.stringify(noCmdSc) + '   显示 = ' + JSON.stringify(noCmdText));
+    if (noCmdSc !== null) { throw new Error('应该返回 null 表示读不到'); }
+    if (noCmdText.indexOf('读不到') < 0) { throw new Error('没告诉用户一声'); }
   });
 
   R.done('设置页');
@@ -839,6 +926,19 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     if (on !== 1) { throw new Error('当前对话没落到别的一条上（高亮 ' + on + ' 个）'); }
   });
 
+  // ---- 快捷键：background 转发过来的 ds-toggle-panel ----
+  R.t('快捷键消息 → 面板开着就收、再按一下又开（面板自己处理，不用刷页面）', function () {
+    var wasOpen = window.__dsPanel.isOpen();
+    var r1 = fireRuntimeMessage({ type: 'ds-toggle-panel' });
+    var mid = window.__dsPanel.isOpen();
+    var r2 = fireRuntimeMessage({ type: 'ds-toggle-panel' });
+    var back = window.__dsPanel.isOpen();
+    R.line('原来 = ' + wasOpen + ' → 按一下 = ' + mid + '（回执 ' + JSON.stringify(r1) + '）→ 再按 = ' + back);
+    if (mid === wasOpen) { throw new Error('按了快捷键面板状态没变'); }
+    if (back !== wasOpen) { throw new Error('再按一下没回到原状'); }
+    if (!r1 || r1.ok !== true) { throw new Error('没给后台回执'); }
+  });
+
   window.__panelDone = true;        // 这一块后面会往 store 里写 'sk-browser-…'，下一块要等它
   R.done('面板');
 })();
@@ -884,6 +984,53 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   R.t('已经配好 Key 时 → 不再弹设置页', function () {
     R.line('openOptionsPage：' + b2 + ' → ' + openedOptions);
     if (openedOptions !== b2) { throw new Error('配过了还弹，会烦人'); }
+  });
+
+  // ---- 快捷键（chrome.commands）的分发 ----
+  R.t('background 挂了快捷键监听', function () {
+    R.line('onCommand 监听数 = ' + commandListeners.length);
+    if (!commandListeners.length) { throw new Error('没挂监听 → 快捷键按了没人管'); }
+  });
+
+  var ctBefore = toggleMsgs().length;
+  var spBefore0 = sidePanelOpens.length;
+  commandListeners.forEach(function (fn) { fn('toggle-panel'); });
+  await wait(90);
+  R.t('按快捷键 → 先问页面里那个面板；有人接就不去开侧栏', function () {
+    var got = toggleMsgs();
+    R.line('发给页面 = ' + JSON.stringify(got.slice(ctBefore)) + '   开侧栏次数 = ' + (sidePanelOpens.length - spBefore0));
+    if (got.length !== ctBefore + 1) { throw new Error('没给页面发消息'); }
+    if (sidePanelOpens.length !== spBefore0) { throw new Error('页面里有人接，不该去开侧栏'); }
+  });
+
+  var tmBefore = toggleMsgs().length;
+  var spBefore1 = sidePanelOpens.length;
+  sendMessageFails = true;                    // 页面里没人接（chrome://、内置 PDF 这类）
+  commandListeners.forEach(function (fn) { fn('toggle-panel'); });
+  await wait(90);
+  sendMessageFails = false;
+  R.t('页面里没人接 → 退到右侧栏，不能"按了没反应"', function () {
+    R.line('试发消息 ' + (toggleMsgs().length - tmBefore) + ' 次，开侧栏 ' + (sidePanelOpens.length - spBefore1) + ' 次');
+    if (sidePanelOpens.length !== spBefore1 + 1) { throw new Error('既没开面板也没开侧栏'); }
+  });
+
+  var spBefore2 = sidePanelOpens.length;
+  var askBefore = tabMessages.filter(function (x) { return x.msg && x.msg.type === 'ds-ask-selection'; }).length;
+  commandListeners.forEach(function (fn) { fn('ask-selection'); });
+  await wait(90);
+  R.t('「送选中的文字」快捷键 → 消息转发给页面，而且**不去开侧栏**', function () {
+    var got = tabMessages.filter(function (x) { return x.msg && x.msg.type === 'ds-ask-selection'; });
+    R.line('转发 = ' + JSON.stringify(got.slice(askBefore)) + '   开侧栏 = ' + (sidePanelOpens.length - spBefore2));
+    if (got.length !== askBefore + 1) { throw new Error('没转发给页面'); }
+    if (sidePanelOpens.length !== spBefore2) { throw new Error('这个键不该开侧栏（页面里才有文字可选）'); }
+  });
+
+  var tmBefore2 = toggleMsgs().length;
+  commandListeners.forEach(function (fn) { fn('some-other-command'); });
+  await wait(70);
+  R.t('别的命令名 → 不理它（只认 toggle-panel）', function () {
+    R.line('消息数 ' + tmBefore2 + ' → ' + toggleMsgs().length);
+    if (toggleMsgs().length !== tmBefore2) { throw new Error('乱响应别的命令'); }
   });
 
   // 收个尾：把面板关掉再出结果，不然它浮在上面，截图/肉眼都被挡住一块看不到报告

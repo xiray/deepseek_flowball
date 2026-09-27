@@ -3138,6 +3138,12 @@
   if (!isHost() && typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.onMessage) {
     try {
       chrome.runtime.onMessage.addListener(function (m, sender, respond) {
+        // 快捷键唤起（background.js 转发过来的）：开着就收，没开就开
+        if (m && m.type === 'ds-toggle-panel') {
+          try { if (isOpen()) { close(); } else { open(); } } catch (e) { }
+          respond({ ok: true, open: isOpen() });
+          return true;   // 保持通道打开
+        }
         if (!m || m.type !== 'ds-grab-page') { return; }
         var out = { ok: true, title: '', url: '', text: '', images: [], visible: '', cut: false };
         try {
@@ -3165,6 +3171,7 @@
     openWithDrop: openWithDrop,
     askSelection: askSelection,    // 划词：content.js 把「选中的文字 + 动作提示词」送进来（只挂 chip，不填输入框）
     grabContext: grabContext,      // 取"当前网页"的内容（网页上读自己，侧栏里读当前标签页）
-    toggle: function () { isOpen() ? close() : open(); }
+    toggle: function () { isOpen() ? close() : open(); },
+    toast: toast                   // content.js 用：快捷键没选中文字时给一句提示
   };
 })();

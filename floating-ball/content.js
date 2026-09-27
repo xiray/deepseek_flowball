@@ -526,6 +526,33 @@
   }, true);
   document.addEventListener('scroll', hideSel, true);
   window.addEventListener('resize', hideSel);
+
+  // ---------- 快捷键：把选中的文字送进面板（background.js 转发过来）----------
+  // 跟"点划词菜单第一颗（问 Nova）"**同一条路** —— 直接复用 runSelAction，
+  // 别在这儿再写一遍读选区的逻辑（那种重复迟早两边不一致）。
+  try {
+    if (chrome.runtime && chrome.runtime.onMessage) {
+      chrome.runtime.onMessage.addListener(function (m, sender, respond) {
+        if (!m || m.type !== 'ds-ask-selection') { return; }
+        var t = selText() || selCache;
+        if (!t) {
+          // 没选中就别静默：把面板叫出来 + 给一句话，总比"按了没反应"强
+          try {
+            if (window.__dsPanel && window.__dsPanel.open) { window.__dsPanel.open(); }
+            if (window.__dsPanel && window.__dsPanel.toast) {
+              window.__dsPanel.toast('没有选中文字 —— 先在网页上选一段，再按这个键');
+            }
+          } catch (e) { /* 面板没起来就算了 */ }
+          respond({ ok: false, reason: 'no-selection' });
+          return true;
+        }
+        runSelAction('问 ' + selAskName, '');
+        respond({ ok: true, chars: t.length });
+        return true;
+      });
+    }
+  } catch (e) { /* 老环境没有这个 API */ }
+
   ball.title = '双击打开对话';
   applyPos();
 

@@ -310,6 +310,27 @@
       if (!document.getElementById('__ds_float_ball__')) { throw new Error('没有 #__ds_float_ball__'); }
     });
 
+    // 快捷键：此时还没选过任何文字（selCache 也是空的）→ 该走"没选中"那条路。
+    // 放在最前面测是有意的：selCache 一旦被填过就清不掉，后面再测就测不到了。
+    t2('快捷键没选中文字 → 不静默，给一句提示', function () {
+      var ph = document.getElementById('__ds_float_panel__');
+      if (!ph) { throw new Error('面板不在'); }
+      if (window.getSelection() && !window.getSelection().isCollapsed) {
+        throw new Error('前提不成立：这时候已经选中了东西');
+      }
+      var got = null;
+      msgListeners.forEach(function (fn) {
+        fn({ type: 'ds-ask-selection' }, { id: 'test-extension-id' }, function (r) { got = r; });
+      });
+      var tip = ph.shadowRoot.querySelector('#toast').textContent;
+      out2.push('   回执 = ' + JSON.stringify(got));
+      out2.push('   提示 = ' + JSON.stringify(tip));
+      if (!got || got.ok !== false || got.reason !== 'no-selection') {
+        throw new Error('内容脚本没接住 / 没报"没选中"：' + JSON.stringify(got));
+      }
+      if (tip.indexOf('没有选中') < 0) { throw new Error('一句话都没给，用户只会以为键坏了'); }
+    });
+
     // 造一段文字并"选中"它，再发一个 mouseup（content.js 就是靠这个触发的）
     var para = document.createElement('p');
     para.textContent = '选中我试试划词提问';
@@ -456,6 +477,31 @@
                   '   气泡数 ' + rowsBefore + ' → ' + ph.shadowRoot.querySelectorAll('.row').length);
         if (!chips.some(function (n) { return n.indexOf('翻译 ·') === 0; })) { throw new Error('没有「翻译」chip'); }
         if (input.value) { throw new Error('输入框被灌了提示词，用户就没法写自己的问题了'); }
+        if (ph.shadowRoot.querySelectorAll('.row').length !== rowsBefore) { throw new Error('自动发送了，用户没机会改'); }
+      });
+
+      // 快捷键：background.js 转发的 ds-ask-selection → 跟点划词菜单第一颗（问 X）同一条路
+      t2('快捷键（ds-ask-selection）→ 把选中的文字挂成 chip，不发送', function () {
+        var ph = document.getElementById('__ds_float_panel__');
+        if (!ph) { throw new Error('面板不在'); }
+        var input = ph.shadowRoot.querySelector('#input');
+        clearChips();
+        sel2();                                   // 重新选中那段字
+        var rowsBefore = ph.shadowRoot.querySelectorAll('.row').length;
+        var got = null;
+        msgListeners.forEach(function (fn) {
+          fn({ type: 'ds-ask-selection' }, { id: 'test-extension-id' }, function (r) { got = r; });
+        });
+        var chips = Array.prototype.map.call(ph.shadowRoot.querySelectorAll('.chip'), function (c) {
+          return c.textContent.replace(/\s+/g, ' ').trim();
+        });
+        out2.push('   回执 = ' + JSON.stringify(got));
+        out2.push('   chips = ' + JSON.stringify(chips));
+        out2.push('   输入框 = ' + JSON.stringify(input.value) +
+                  '   气泡数 ' + rowsBefore + ' → ' + ph.shadowRoot.querySelectorAll('.row').length);
+        if (!got || got.ok !== true) { throw new Error('内容脚本没接住这个快捷键消息'); }
+        if (!chips.length) { throw new Error('没挂上 chip'); }
+        if (input.value) { throw new Error('不该往输入框灌正文'); }
         if (ph.shadowRoot.querySelectorAll('.row').length !== rowsBefore) { throw new Error('自动发送了，用户没机会改'); }
       });
 

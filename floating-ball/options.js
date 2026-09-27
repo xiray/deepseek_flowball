@@ -84,6 +84,9 @@
     '.dsopt .st.bad{color:#c0392b}',
     '.dsopt .st.warn{color:#b45309}',
     '.dsopt .cur{font-size:12.5px;margin:4px 0 0;color:#5b6169}',
+    '.dsopt .kbd{font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:12px;',
+    'background:rgba(0,0,0,.07);padding:2px 7px;border-radius:6px}',
+    '.dsopt .hint{font-size:12.5px;color:#5b6169;margin:8px 0 0}',
     '.dsopt .legacy{border-color:rgba(217,119,6,.35);background:rgba(217,119,6,.05)}',
     '.dsopt .legacy b{font-size:13.5px}',
     '.dsopt .legacy p{font-size:12.5px;color:#5b6169;margin:6px 0 0}',
@@ -91,8 +94,9 @@
     '.dsopt a{color:#3f5ae0}',
     '@media (prefers-color-scheme: dark){',
     '.dsopt{color:#eceef1}',
-    '.dsopt .lead,.dsopt .st,.dsopt .cur,.dsopt .foot,.dsopt .legacy p{color:#a6abb3}',
+    '.dsopt .lead,.dsopt .st,.dsopt .cur,.dsopt .foot,.dsopt .legacy p,.dsopt .hint{color:#a6abb3}',
     '.dsopt code{background:rgba(255,255,255,.12)}',
+    '.dsopt .kbd{background:rgba(255,255,255,.12)}',
     '.dsopt .card{background:#232428;border-color:rgba(255,255,255,.14);box-shadow:none}',
     '.dsopt input{background:#1c1d20;border-color:rgba(255,255,255,.2)}',
     '.dsopt .btn.ghost{background:rgba(255,255,255,.1)}',
@@ -140,6 +144,18 @@
       + '  <div class="row2"><button class="btn" id="dso-move" type="button">搬进浏览器</button></div>'
       + '</div>'
 
+      + '<div class="card">'
+      + '  <label>唤起快捷键</label>'
+      + '  <p class="cur" id="dso-key-now">正在读……</p>'
+      + '  <div class="row2"><button class="btn ghost" id="dso-keys" type="button">去改快捷键</button></div>'
+      + '  <p class="st" id="dso-key-st"></p>'
+      + '  <p class="hint">默认 <b class="kbd">Alt + 空格</b> 开 / 收面板（新标签页、设置页、PDF 这些'
+      + '「球进不去」的地方会开右侧栏），<b class="kbd">Alt + Q</b> 把网页上选中的文字送进面板（只挂起来，'
+      + '不自动发送，等你补一句）。</p>'
+      + '  <p class="hint">Chrome 不让扩展自己改快捷键（安全限制），只能去 Chrome 自己那个页面改 —— '
+      + '按钮点开就是。</p>'
+      + '</div>'
+
       + '<p class="foot">申请 / 管理 Key：'
       + '<a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer">'
       + 'platform.deepseek.com/api_keys</a>'
@@ -157,7 +173,10 @@
       cur: root.querySelector('#dso-cur'),
       legacy: root.querySelector('#dso-legacy'),
       legacyVal: root.querySelector('#dso-legacy-val'),
-      move: root.querySelector('#dso-move')
+      move: root.querySelector('#dso-move'),
+      keyNow: root.querySelector('#dso-key-now'),
+      keySt: root.querySelector('#dso-key-st'),
+      keys: root.querySelector('#dso-keys')
     };
 
     el.show.addEventListener('click', function () { toggleShow(); });
@@ -165,8 +184,88 @@
     el.test.addEventListener('click', function () { test(); });
     el.clear.addEventListener('click', function () { clear(); });
     el.move.addEventListener('click', function () { moveLegacy(); });
+    el.keys.addEventListener('click', function () { openKeys(); });
     el.key.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') { e.preventDefault(); save(); }
+    });
+  }
+
+  // ---------- 唤起快捷键（manifest 里的 commands.toggle-panel） ----------
+  // Chrome 报回来的键名（Alt+Space、Ctrl+Shift+Comma…）翻成人看的样子。
+  // 只翻 Chrome 允许出现在快捷键里的那几个特殊键，字母数字原样。
+  var KEY_NAME = {
+    Space: '空格', Comma: '逗号', Period: '句号',
+    Up: '↑', Down: '↓', Left: '←', Right: '→',
+    MediaNextTrack: '媒体下一首', MediaPrevTrack: '媒体上一首',
+    MediaPlayPause: '播放/暂停', MediaStop: '停止播放'
+  };
+  function keyLabel(s) {
+    return String(s || '').split('+').map(function (p) {
+      var k = p.trim();
+      return k ? (KEY_NAME[k] || k) : '';
+    }).filter(Boolean).join(' + ');
+  }
+
+  // 我们自己声明的那两条（名字要和 manifest 里的 commands 对齐）
+  var OUR_KEYS = [
+    { name: 'toggle-panel', label: '打开 / 收起面板' },
+    { name: 'ask-selection', label: '把选中的文字送进面板' }
+  ];
+
+  // 读当前快捷键。返回：{命令名: 键位}（''=没设）/ null = 这个环境读不到。
+  // 要能区分"没设"和"读不到" —— 自检页和很老的浏览器都没有 chrome.commands。
+  function readShortcuts() {
+    return new Promise(function (res) {
+      try {
+        if (chrome.commands && chrome.commands.getAll) {
+          chrome.commands.getAll(function (list) {
+            var by = {};
+            (list || []).forEach(function (c) { if (c && c.name) { by[c.name] = String(c.shortcut || ''); } });
+            var out = {};
+            OUR_KEYS.forEach(function (k) { out[k.name] = (k.name in by) ? by[k.name] : ''; });
+            res(out);
+            return;
+          });
+          return;
+        }
+      } catch (e) { /* 落到下面 */ }
+      res(null);
+    });
+  }
+
+  // 去 Chrome 自己的快捷键页。**扩展没有改快捷键的权限**（Chrome 的安全限制），
+  // 所以"设置页里可自定义"只能是"给个入口 + 告诉你现在绑的是哪个键"。
+  function openKeys() {
+    try {
+      if (chrome.tabs && chrome.tabs.create) {
+        chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
+        if (el.keySt) {
+          el.keySt.className = 'st ok';
+          el.keySt.textContent = '已打开 Chrome 的快捷键页；没看到的话手动访问 chrome://extensions/shortcuts';
+        }
+        return true;
+      }
+    } catch (e) { /* 落到下面 */ }
+    if (el.keySt) {
+      el.keySt.className = 'st warn';
+      el.keySt.textContent = '这个环境打不开，请手动访问 chrome://extensions/shortcuts';
+    }
+    return false;
+  }
+
+  function syncKeys() {
+    return readShortcuts().then(function (sc) {
+      if (!el.keyNow) { return sc; }
+      if (sc === null) {
+        el.keyNow.textContent = '这个环境读不到快捷键设置（不影响扩展本身）。';
+        return sc;
+      }
+      el.keyNow.innerHTML = OUR_KEYS.map(function (k) {
+        var v = sc[k.name];
+        return esc(k.label) + '：' + (v ? '<b class="kbd">' + esc(keyLabel(v)) + '</b>'
+                                       : '<span class="kbd">还没设</span>');
+      }).join('<br>');
+      return sc;
     });
   }
 
@@ -199,6 +298,8 @@
       // 这样你只需要点一下「保存」，不用去把那一长串复制一遍
       if (!k && lg && !el.key.value) { el.key.value = lg; }
       return k;
+    }).then(function (k) {
+      return syncKeys().then(function () { return k; });
     });
   }
 
@@ -271,6 +372,7 @@
   window.__dsOptions = {
     save: save, test: test, clear: clear, refresh: refresh,
     moveLegacy: moveLegacy, mask: mask,
+    keyLabel: keyLabel, syncKeys: syncKeys, openKeys: openKeys, readShortcuts: readShortcuts,
     els: function () { return el; }
   };
 })();

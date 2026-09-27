@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "DeepSeek 悬浮球",
-  "version": "3.6",
+  "version": "3.8",
   "description": "可拖动的 DeepSeek 悬浮球：拖动有惯性、鼠标碰到放大、用力丢向边缘会吸住；双击开对话面板，把文件或文字拖到球上直接开小窗提问。API Key 在设置页里配，代码里没有。",
   "icons": {
     "16": "icons/icon16.png",
@@ -15,6 +15,16 @@
   ],
   "action": {
     "default_title": "打开 DeepSeek 对话（右侧栏）"
+  },
+  "commands": {
+    "toggle-panel": {
+      "suggested_key": { "default": "Alt+Space" },
+      "description": "打开 / 收起对话面板（新标签页这类地方开右侧栏）"
+    },
+    "ask-selection": {
+      "suggested_key": { "default": "Alt+Q" },
+      "description": "把选中的文字送进面板（只挂起来，不自动发送）"
+    }
   },
   "options_ui": {
     "page": "options.html",

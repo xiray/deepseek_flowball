@@ -97,6 +97,22 @@
       <img src="shots/panel-fullscreen.png" alt="全屏模式">
       <figcaption><b>全屏模式</b><p>右上角 ⛶ 铺满整个视口，方便读长回答；再点一下回到原样，Esc 先退全屏。</p></figcaption>
     </figure>
+    <figure>
+      <img src="shots/options-zh.png" alt="设置页（中文）">
+      <figcaption><b>设置页 · 中文</b><p>API Key 在这儿配（存在浏览器里，代码里没有）。右上角「界面语言」选一次就记住。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/options-en.png" alt="Settings page (English)">
+      <figcaption><b>设置页 · English</b><p>同一个页面，换语言只是换文字：按钮、状态行、快捷键那两行的键名（空格 → Space）都会跟着换，已经粘进输入框还没保存的 Key 不会丢。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-zh.png" alt="对话面板（中文）">
+      <figcaption><b>对话面板 · 中文</b><p>球双击出来的就是它。用量那一行（输入 / 命中 / 输出 / 思考）是这一轮真正花掉的 token。</p></figcaption>
+    </figure>
+    <figure>
+      <img src="shots/panel-en.png" alt="Chat panel (English)">
+      <figcaption><b>对话面板 · English</b><p>同一个面板，切到英文后连占位符、按钮、提示语、思考档位一起换（不重建对话）。切的时候输入框里没发出去的字、抽屉开着没开，都原样留着。</p></figcaption>
+    </figure>
   </div>
 
   <h2>文件角色</h2>
@@ -105,6 +121,7 @@
     <tr><td><code>manifest.json</code></td><td>清单：名称、图标、权限、脚本注入规则、设置页入口</td></tr>
     <tr><td><code>config.js</code></td><td><b>你要动的文件</b>：模型列表、思考档位、界面人设（<b>API Key 不在这儿</b>）</td></tr>
     <tr><td><code>options.html</code> + <code>options.js</code></td><td>设置页：<b>API Key 在这儿配</b>，存在浏览器里，代码里不留</td></tr>
+    <tr><td><code>i18n.js</code></td><td><b>中英文词表，设置页和对话面板共用</b>（设置页的 key 不带前缀，面板的是 <code>p.*</code>）</td></tr>
     <tr><td><code>panel.js</code></td><td>对话面板：界面、历史记录、流式请求、读网页、附件、取 Key</td></tr>
     <tr><td><code>content.js</code></td><td>悬浮球本体：拖动、惯性、吸附、双击开面板、接收拖拽</td></tr>
     <tr><td><code>sidepanel.html</code> + <code>sidepanel.js</code></td><td>侧边栏入口：点工具栏图标，右侧栏里跑同一个面板</td></tr>
@@ -113,7 +130,7 @@
     <tr><td><code>README.md</code></td><td>完整说明文档（安装、参数、实现细节）</td></tr>
     <tr><td><code>docs/</code></td><td>本页 + 截图 + 三个自检页 + 图标源文件，<b>不影响运行，可整包删除</b></td></tr>
   </table>
-  <p class="tip">只有上面 9 个文件加 <code>icons/</code> 是运行必需的。要打包上架，`README.md` 和 `docs/` 可以先排除。</p>
+  <p class="tip">只有上面这些文件加 <code>icons/</code> 是运行必需的。要打包上架，`README.md` 和 `docs/` 可以先排除。</p>
 
   <footer>截图由无头 Chrome 实测生成，不是设计稿。</footer>
 </div>

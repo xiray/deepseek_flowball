@@ -112,6 +112,9 @@ window.confirm = function () { return true; };     // 清空那个二次确认�
 var fetchCalls = [];
 // 下一条回答的内容：测「推荐图片」时要能控制模型返回什么（那段标记就是从这儿进来的）
 var nextReply = 'hi';
+// 故障注入：'' = 正常；'offline' = 网络层就失败（本机真凶是代理）；数字 = 返回那个 HTTP 状态码。
+// 用来验「接口错误翻译成人话」这条 —— 不然只能靠真把 Key 弄错才能看到那个界面。
+var fetchMode = '';
 window.fetch = function (url, opt) {
   var body = null;
   try { body = JSON.parse(opt && opt.body); } catch (e) {}
@@ -123,6 +126,12 @@ window.fetch = function (url, opt) {
     model: body && body.model,
     stream: !!(body && body.stream),
     effort: body && body.reasoning_effort,
+    // 思考模式现在由**两个字段**表达（见 panel.js 的 withEffort）：
+    //   thinking:{type:'enabled'|'disabled'} 才是开关；reasoning_effort 只在开着时才发。
+    //   老写法只发 reasoning_effort:'none' 想关思考 —— 那个值官方不认，会被静默忽略。
+    thinking: body && body.thinking,
+    hasEffortKey: !!(body && body.reasoning_effort !== undefined),
+    streamOptions: body && body.stream_options,
     text: body && body.messages ? JSON.stringify(body.messages) : ''
   });
   if (u.indexOf('/user/balance') >= 0) {     // 查余额：官方那个只读接口的真实结构
@@ -137,9 +146,33 @@ window.fetch = function (url, opt) {
       }
     });
   }
+  // 故障注入：模拟"请求没成功"，跟下面那条正常响应是两条路（查余额在上面，不受影响）
+  if (fetchMode === 'offline') {
+    return Promise.reject(new TypeError('Failed to fetch'));
+  }
+  if (fetchMode) {
+    var code = Number(fetchMode);
+    return Promise.resolve({
+      ok: false, status: code, body: null,
+      text: function () {
+        return Promise.resolve(JSON.stringify({ error: { message: 'mock failure', type: 'mock' } }));
+      }
+    });
+  }
   return Promise.resolve({
     ok: true, status: 200, body: null,
-    json: function () { return Promise.resolve({ choices: [{ message: { content: nextReply } }] }); }
+    // usage 是**非流式的顶层字段 / 流式最后一包**里的东西：面板把它画成气泡底部那行
+    // 「输入 / 命中 / 输出 / 思考」。给一组像真的数字，"用量那行到底渲染没渲染"才验得了。
+    json: function () {
+      return Promise.resolve({
+        choices: [{ message: { content: nextReply } }],
+        usage: {
+          prompt_tokens: 1234, completion_tokens: 56,
+          prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 234,
+          completion_tokens_details: { reasoning_tokens: 30 }
+        }
+      });
+    }
   });
 };
 
@@ -148,6 +181,7 @@ window.__DS_BALL_VISIBLE = function () {};
 window.__DS_ICON_PATH = '';
 </script>
 
+<script src="../i18n.js"></script>
 <script src="../config.js"></script>
 <script src="../options.js"></script>
 <script src="../panel.js"></script>
@@ -303,6 +337,74 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     if (noCmdText.indexOf('读不到') < 0) { throw new Error('没告诉用户一声'); }
   });
 
+  // ---- 界面语言：中文 / English ----
+  // 只换这一页的文字（对话面板那 300 多处还没接，单独一轮）。
+  // 这一组断言逼出来的两个坑都写在注释里，改词表之前先看一眼。
+  R.t('设置页有语言下拉，默认中文', function () {
+    var sel = els.lang;
+    var h1 = els.root.querySelector('h1').textContent;
+    R.line('下拉 = ' + JSON.stringify(sel && sel.value) + '   标题 = ' + JSON.stringify(h1));
+    if (!sel) { throw new Error('没有语言下拉'); }
+    if (sel.value !== 'zh') { throw new Error('默认不是中文：' + sel.value); }
+    if (h1.indexOf('设置') < 0) { throw new Error('标题不是中文'); }
+  });
+
+  // 先造一个"config.js 里还有旧 key"的状态 —— 下面要验切语言时那一行的遮罩值还在
+  window.DS_CONFIG.apiKey = 'sk-legacy-OLDKEY-1234';
+  els.key.value = 'sk-typing-not-saved';        // 顺手留一个"正在打、还没保存"的 key
+  await opt.refresh();
+
+  await opt.setLang('en');
+  await wait(60);
+  R.t('切到 English：静态文案和算出来的那几行都换，选过的语言也存下来', function () {
+    var h1 = els.root.querySelector('h1').textContent;
+    var save = els.root.querySelector('#dso-save').textContent;
+    var langAttr = document.documentElement.getAttribute('lang');
+    R.line('标题 = ' + JSON.stringify(h1) + '   保存按钮 = ' + JSON.stringify(save));
+    R.line('当前状态行 = ' + JSON.stringify(els.cur.textContent));
+    R.line('快捷键那块 = ' + JSON.stringify(els.keyNow.textContent));
+    R.line('storage = ' + JSON.stringify(__store.__ds_lang__) + '   <html lang> = ' + langAttr);
+    if (h1.indexOf('Settings') < 0) { throw new Error('标题没换'); }
+    if (save !== 'Save') { throw new Error('按钮没换：' + save); }
+    // 这两行不是写死的文本，是 refresh()/syncKeys() 算出来的 —— 最容易漏掉不换的那两块。
+    // 这一刻 storage 里没 key，所以它是「还没配」那一支；换语言后应该整句英文。
+    if (els.cur.textContent.indexOf('No key yet') < 0) { throw new Error('"还没配 Key"那行还是中文'); }
+    if (els.keyNow.textContent.indexOf('Open / close panel') < 0) { throw new Error('快捷键那块还是中文'); }
+    if (els.keyNow.textContent.indexOf('空格') >= 0) { throw new Error('键名「空格」没跟着变 Space'); }
+    if (__store.__ds_lang__ !== 'en') { throw new Error('没存下来，下次打开又变回中文'); }
+    if (langAttr !== 'en') { throw new Error('<html lang> 没跟着改，读屏会拿中文音读英文'); }
+  });
+
+  R.t('切语言不弄丢输入框里正打着、还没保存的 key', function () {
+    var show = els.root.querySelector('#dso-show').textContent;
+    R.line('输入框 = ' + JSON.stringify(els.key.value) + '   显示/隐藏按钮 = ' + JSON.stringify(show));
+    if (els.key.value !== 'sk-typing-not-saved') { throw new Error('把正在打的 key 弄丢了'); }
+    if (show !== 'Show') { throw new Error('显示按钮没跟着换：' + show); }
+  });
+
+  R.t('旧 key 那块的遮罩值还在（没被 innerHTML 整段换掉节点）', function () {
+    // 坑：那段文案里夹着 <code id="dso-legacy-val">。要是把它也写进 *-html 的模板里，
+    // 每次换语言都会重建这个节点，el 里抓着的还是旧的 → 页面上那一行永远空着。
+    R.line('显示 = ' + JSON.stringify(els.legacyVal.textContent) + '   hidden = ' + els.legacy.hidden);
+    if (els.legacy.hidden) { throw new Error('旧 key 提示块没出现'); }
+    if (!els.legacyVal.textContent) { throw new Error('那一行空了 —— 节点被整段重写换掉了'); }
+    if (els.legacyVal.textContent.indexOf('1234') < 0) { throw new Error('遮罩值不对'); }
+  });
+
+  await opt.setLang('zh');
+  await wait(60);
+  R.t('切回中文：恢复原样', function () {
+    var h1 = els.root.querySelector('h1').textContent;
+    R.line('标题 = ' + JSON.stringify(h1) + '   storage = ' + JSON.stringify(__store.__ds_lang__));
+    if (h1.indexOf('设置') < 0) { throw new Error('没切回来'); }
+    if (els.root.querySelector('#dso-save').textContent !== '保存') { throw new Error('按钮没切回来'); }
+  });
+
+  // 收工：把这条假配置撤掉，别留给后面那块
+  window.DS_CONFIG.apiKey = '';
+  els.key.value = '';
+  await opt.refresh();
+
   R.done('设置页');
   window.__optionsDone = true;      // 下一块别抢：这一块会往 store 里写 key 又清掉
 })();
@@ -358,11 +460,22 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   R.t('配好之后：请求带上了浏览器里那份 Key（不是代码里的）', function () {
     var c = fetchCalls[fetchCalls.length - 1];
     R.line('请求 ' + c.url);
-    R.line('Authorization = ' + c.auth + '   model = ' + c.model + '   stream = ' + c.stream + '   effort = ' + c.effort);
+    R.line('Authorization = ' + c.auth + '   model = ' + c.model + '   stream = ' + c.stream);
+    R.line('thinking = ' + JSON.stringify(c.thinking) + '   reasoning_effort = ' + JSON.stringify(c.effort) +
+           '   stream_options = ' + JSON.stringify(c.streamOptions));
     if (fetchCalls.length !== before + 1) { throw new Error('请求数不对：' + (fetchCalls.length - before)); }
     if (c.auth !== 'Bearer sk-browser-1234567890') { throw new Error('Authorization 不对：' + c.auth); }
     if (!c.stream) { throw new Error('没带 stream:true'); }
     if (!c.effort) { throw new Error('没带上思考强度'); }
+    // 默认档（config.js 的 effort:'high'）：要**显式**开思考，档位值也得是官方认的
+    if (!c.thinking || c.thinking.type !== 'enabled') {
+      throw new Error('没发 thinking:{type:enabled}：' + JSON.stringify(c.thinking));
+    }
+    if (c.effort !== 'high') { throw new Error('默认档不是官方的 high：' + c.effort); }
+    // 必须主动要 usage，否则"这一轮花了多少"根本无从得知 —— 那是省钱的唯一尺子
+    if (!c.streamOptions || c.streamOptions.include_usage !== true) {
+      throw new Error('没要 usage（stream_options.include_usage）');
+    }
   });
 
   R.t('回答渲染进了气泡（这条路是通的，不只是发了请求）', function () {
@@ -613,6 +726,74 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     if (thirdFull.indexOf('第三段：这是新加的一段') < 0) { throw new Error('页面变了却没重发，模型手里是旧的'); }
   });
 
+  // ---- 附件正文的增量缓存（2026-10-13 补）----
+  // 上面那套只解决"同一页连着问"。附件**比正文更贵**（单个上限 20 万字符）却一直没有这套东西 ——
+  // 拖一份长文档追问 5 轮，那 20 万字原来要原样发 5 遍。下面验三件事：
+  // 第一次整段发、同一份再来只发一行"没变"、换了内容必须老老实实重发。
+  var ATT_MARK = '附件里第一句：这段话用来模拟拖进来的长文档';
+  var ATT_BODY = ATT_MARK + '\n' + '附件正文。'.repeat(500);
+  function attachText(name, body) {
+    var inp = sr.querySelector('#file');
+    var dt = new DataTransfer();
+    dt.items.add(new File([body], name, { type: 'text/plain' }));
+    inp.files = dt.files;                       // Chrome 允许把 DataTransfer 的 FileList 塞回去
+    inp.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  attachText('doc.txt', ATT_BODY);
+  await wait(200);                              // 走的是 FileReader，异步
+  R.t('拖进一个文本附件 → chip 上出现文件名', function () {
+    var names = Array.prototype.map.call(sr.querySelectorAll('.chip'), function (c) { return c.textContent; })
+      .join(' ').replace(/\s+/g, ' ').trim();
+    R.line('chips = ' + JSON.stringify(names));
+    if (names.indexOf('doc.txt') < 0) { throw new Error('附件没进 chip（FileReader 还没读完？）'); }
+  });
+
+  var a1 = fetchCalls.length;
+  input.value = '附件里说了啥';
+  send.click();
+  await wait(250);
+  var attFirst = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('第一次发：附件正文整段带上', function () {
+    R.line('附件正文出现 ' + countIn(attFirst, ATT_MARK) + ' 次，请求共 ' + attFirst.length + ' 字符');
+    if (fetchCalls.length !== a1 + 1) { throw new Error('没发出去'); }
+    if (countIn(attFirst, ATT_MARK) !== 1) { throw new Error('附件正文没进请求'); }
+  });
+
+  attachText('doc.txt', ATT_BODY);              // 同一份内容再拖一次
+  await wait(200);
+  var a2 = fetchCalls.length;
+  input.value = '再讲讲附件第二段';
+  send.click();
+  await wait(250);
+  var attSecond = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('同一份附件再拖一次：只发一行"没变"，不整段重发', function () {
+    // 和网页正文一样，这里断言的是**出现次数**：历史里那份还在，所以"没重发"= 1 次而不是 0 次
+    var n = countIn(attSecond, ATT_MARK);
+    R.line('附件正文出现 ' + n + ' 次（复用成功应为 1）  请求共 ' + attSecond.length + ' 字符');
+    R.line('提示 = ' + JSON.stringify(sr.querySelector('#toast').textContent));
+    if (fetchCalls.length !== a2 + 1) { throw new Error('没发出去'); }
+    if (attSecond.indexOf('完全相同') < 0) { throw new Error('没有那行"没变"的标记'); }
+    if (n !== 1) { throw new Error('附件正文被重复带了 ' + n + ' 遍'); }
+    if (attSecond.indexOf('再讲讲附件第二段') < 0) { throw new Error('这轮的提问没发出去'); }
+  });
+
+  attachText('other.txt', ATT_MARK + '\n这一份内容不一样。');
+  await wait(200);
+  var a3 = fetchCalls.length;
+  input.value = '换个附件呢';
+  send.click();
+  await wait(250);
+  var attThird = (fetchCalls[fetchCalls.length - 1] || {}).text || '';
+  R.t('换了一份附件 → 指纹变了，必须重发全文', function () {
+    R.line('含 other.txt = ' + (attThird.indexOf('other.txt') >= 0) +
+           '   含新内容 = ' + (attThird.indexOf('这一份内容不一样') >= 0) +
+           '   请求共 ' + attThird.length + ' 字符');
+    if (fetchCalls.length !== a3 + 1) { throw new Error('没发出去'); }
+    if (attThird.indexOf('other.txt') < 0) { throw new Error('新附件的名字没进请求'); }
+    if (attThird.indexOf('这一份内容不一样') < 0) { throw new Error('新附件的正文没进请求'); }
+  });
+
   // ---- 会话回滚（最小版）：回到某条之前 + 把那条放回输入框 ----
   var rowsBeforeRoll = sr.querySelectorAll('.row').length;
   R.t('用户气泡上有「回到这里」，助手气泡上没有', function () {
@@ -857,6 +1038,46 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     if (nImg !== 3) { throw new Error('带图条数不对：' + nImg + '（应该是 3）'); }
   });
 
+  R.t('气泡底部画出了这一轮的用量（输入 / 命中 / 输出 / 思考）', function () {
+    var us = sr.querySelectorAll('.usage');
+    var last = us[us.length - 1];
+    R.line('.usage 行数 = ' + us.length + '，最后一条 = ' + JSON.stringify(last ? last.textContent : null));
+    R.line('诊断：.bubble=' + sr.querySelectorAll('.bubble').length + '  .row=' + sr.querySelectorAll('.row').length +
+           '  .reco=' + sr.querySelectorAll('.reco').length + '  .body=' + sr.querySelectorAll('.body').length +
+           '  .think=' + sr.querySelectorAll('.think').length + '  sr.innerHTML=' + sr.innerHTML.length);
+    if (!last) { throw new Error('没有 .usage 那行'); }
+    if (last.textContent.indexOf('输入 1.2k') < 0) { throw new Error('输入 token 没显示：' + last.textContent); }
+    if (last.textContent.indexOf('命中 1.0k') < 0) { throw new Error('缓存命中没显示（省钱最该盯的就是这个数）：' + last.textContent); }
+    if (last.textContent.indexOf('输出 56') < 0) { throw new Error('输出 token 没显示：' + last.textContent); }
+    if (last.textContent.indexOf('思考 30') < 0) { throw new Error('思考 token 没显示：' + last.textContent); }
+  });
+
+  // ---- 切到「不思考」再发一次：官方认的关法是 thinking:{type:'disabled'}，
+  //      而不是把 reasoning_effort 设成 'none'（那个值不在合法列表里，会被**静默忽略**，
+  //      模型照旧思考 —— 钱白花还慢，而且从外面完全看不出来）。----
+  var nNoThink = fetchCalls.length;
+  var selEffort = sr.querySelector('#effort');
+  selEffort.value = 'none';
+  selEffort.dispatchEvent(new Event('change'));
+  input.value = '再来一次';
+  send.click();
+  await wait(220);
+  R.t('选「不思考」：改发 thinking:{type:disabled}，而且**不再带** reasoning_effort', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    R.line('thinking = ' + JSON.stringify(c.thinking) + '   reasoning_effort 字段在不在 = ' + c.hasEffortKey +
+           '（值 ' + JSON.stringify(c.effort) + '）');
+    if (fetchCalls.length !== nNoThink + 1) { throw new Error('请求数不对：' + (fetchCalls.length - nNoThink)); }
+    if (!c.thinking || c.thinking.type !== 'disabled') {
+      throw new Error('没发 thinking:{type:disabled} —— 模型会照旧思考，钱白花：' + JSON.stringify(c.thinking));
+    }
+    if (c.hasEffortKey) {
+      throw new Error('关思考时还发了 reasoning_effort（官方不认 none，会被静默忽略）');
+    }
+  });
+  // 复原成默认档，别影响后面的块
+  selEffort.value = 'high';
+  selEffort.dispatchEvent(new Event('change'));
+
   // ---- 两个标签页真的"通"了：模拟另一个窗口往同一个对话里写 ----
   // fireStorage 会把面板注册的 storage.onChanged 真的调起来（跟另一个标签页写的效果一样）。
   function chatsInStore() { return __store.__ds_chats__ || []; }
@@ -938,6 +1159,81 @@ function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
     if (back !== wasOpen) { throw new Error('再按一下没回到原状'); }
     if (!r1 || r1.ok !== true) { throw new Error('没给后台回执'); }
   });
+
+  // ---- 这一轮新加的两样：错误翻译 + 气泡上的「重试」 ----
+  // ⚠ 上面那条快捷键测试 toggle 过面板，而 **open() 会重建 UI** —— 前面抓的 sr/input/send
+  //   这会儿全脱离文档了。所以这里必须重新拿一遍（这个坑踩过一次，写在注释里防复发）。
+  var sr2 = document.getElementById('__ds_float_panel__').shadowRoot;
+  var input2 = sr2.querySelector('#input');
+  var send2 = sr2.querySelector('#send');
+
+  function lastAi() {
+    var rows = sr2.querySelectorAll('.row.ai .bubble');
+    return rows[rows.length - 1] || null;
+  }
+
+  // 网络层就失败（这台机器上的真凶：Clash 的系统代理，或用代理时核心没跑）
+  fetchMode = 'offline';
+  input2.value = '断网的时候问一句';
+  send2.click();
+  await wait(280);
+  R.t('连不上接口 → 翻译成人话（点出代理这个真凶），不是干甩一句 Failed to fetch', function () {
+    var b = lastAi();
+    var txt = b ? b.textContent : '';
+    R.line('气泡里 = ' + JSON.stringify(txt.slice(0, 150)));
+    if (txt.indexOf('连不上 api.deepseek.com') < 0) {
+      throw new Error('没翻译成"连不上"：' + txt.slice(0, 120));
+    }
+    if (txt.indexOf('代理') < 0) { throw new Error('没提代理 —— 这台机器上那才是最常见的原因'); }
+    if (txt.indexOf('Failed to fetch') >= 0) { throw new Error('又把原始英文甩给用户了'); }
+    if (!b.querySelector('.cp-retry')) { throw new Error('失败的回答上没有「重试」按钮'); }
+  });
+
+  // 点「重试」→ 用**同样的上文**再打一次接口。这就是"换了答案"而不是"重打问题"。
+  fetchMode = '';
+  var rowsBeforeRetry = sr2.querySelectorAll('.row').length;
+  var nBeforeRetry = fetchCalls.length;
+  var rb = lastAi();
+  if (rb) { var rbBtn = rb.querySelector('.cp-retry'); if (rbBtn) { rbBtn.click(); } }
+  await wait(280);
+  R.t('点「重试」：原地再打一次接口，问题不动、气泡数也不变', function () {
+    var c = fetchCalls[fetchCalls.length - 1];
+    var msgs = [];
+    try { msgs = JSON.parse(c.text); } catch (e) {}
+    R.line('重试请求：model=' + c.model + '  stream=' + c.stream +
+           '  消息数=' + msgs.length + '  末条角色=' + (msgs[msgs.length - 1] || {}).role);
+    R.line('气泡数 ' + rowsBeforeRetry + ' → ' + sr2.querySelectorAll('.row').length);
+    if (fetchCalls.length !== nBeforeRetry + 1) {
+      throw new Error('重试没再打接口（新增请求数 ' + (fetchCalls.length - nBeforeRetry) + '）');
+    }
+    if (!msgs.length || msgs[msgs.length - 1].role !== 'user') {
+      throw new Error('重试时末条不是用户消息 —— 上文接错了：' + JSON.stringify(msgs.slice(-1)));
+    }
+    if (msgs[msgs.length - 1].content.indexOf('断网的时候问一句') < 0) {
+      throw new Error('重试没带上原来那个问题');
+    }
+    if (sr2.querySelectorAll('.row').length !== rowsBeforeRetry) {
+      throw new Error('重试把气泡数改了（该是原地替换）');
+    }
+    var b = lastAi();
+    var txt = b ? b.textContent : '';
+    if (txt.indexOf('连不上') >= 0) { throw new Error('重试成功了，但气泡里还留着上一次的错误'); }
+    if (txt.indexOf(nextReply) < 0) { throw new Error('新的回答没写进气泡：' + JSON.stringify(txt.slice(0, 80))); }
+  });
+
+  // 401：Key 不对。该指到设置页那几个具体入口，而不是甩一个 HTTP 401 让人自己猜。
+  fetchMode = '401';
+  var rbA = lastAi();
+  if (rbA) { var rbABtn = rbA.querySelector('.cp-retry'); if (rbABtn) { rbABtn.click(); } }
+  await wait(280);
+  R.t('Key 失效（401）→ 指到 ⚙ 设置页，而不是甩一个 HTTP 401', function () {
+    var txt = lastAi() ? lastAi().textContent : '';
+    R.line('气泡里 = ' + JSON.stringify(txt.slice(0, 130)));
+    if (txt.indexOf('API Key') < 0) { throw new Error('没提 API Key：' + txt.slice(0, 100)); }
+    if (txt.indexOf('⚙') < 0) { throw new Error('没指到设置入口'); }
+    if (txt.indexOf('HTTP 401') >= 0) { throw new Error('把状态码原样甩出来了'); }
+  });
+  fetchMode = '';          // 收工：后面的块别再吃这个故障
 
   window.__panelDone = true;        // 这一块后面会往 store 里写 'sk-browser-…'，下一块要等它
   R.done('面板');

@@ -6,7 +6,7 @@
   "minimum_chrome_version": "111",
 
   "permissions": ["storage"],
-  "host_permissions": ["https://api.deepseek.com/*"],
+  "host_permissions": ["https://api.deepseek.com/*", "<all_urls>"],
 
   "background": {
     "service_worker": "background.js"
@@ -41,6 +41,7 @@
         "content/parse.js",
         "content/overlay.js",
         "content/pipeline.js",
+        "content/vision.js",
         "content/main.js"
       ],
       "run_at": "document_idle",

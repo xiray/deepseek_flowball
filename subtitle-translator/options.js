@@ -5,7 +5,8 @@
   var ids = [
     'apiKey', 'baseUrl', 'model', 'targetLang', 'prefetchAhead',
     'batchSize', 'concurrency', 'fontScale', 'showMode',
-    'autoEnableTracks', 'domFallback', 'debug'
+    'autoEnableTracks', 'domFallback', 'screenReader',
+    'screenRegion', 'screenInterval', 'debug'
   ];
 
   function $(id) { return document.getElementById(id); }
@@ -74,6 +75,10 @@
     out.batchSize = Math.max(1, Math.min(20, Math.round(out.batchSize)));
     out.concurrency = Math.max(1, Math.min(4, Math.round(out.concurrency)));
     out.fontScale = Math.max(0.6, Math.min(2, out.fontScale));
+    if (!isFinite(out.screenRegion)) out.screenRegion = DS_DEFAULTS.screenRegion;
+    out.screenRegion = Math.max(0.1, Math.min(1, out.screenRegion));
+    if (!isFinite(out.screenInterval)) out.screenInterval = DS_DEFAULTS.screenInterval;
+    out.screenInterval = Math.max(500, Math.min(10000, Math.round(out.screenInterval)));
     return out;
   }
 
@@ -128,6 +133,68 @@
           '对齐 ' + resp.matched + '/3。译文：' + sample,
           'ok');
         $('errorCard').hidden = true;
+      });
+    });
+  });
+
+  /* 现场画一张带英文句子的图，走真实的图像接口跑一遍。
+     比「点一下看通不通」更有意义 —— 它验证的是 vision 链本身能不能用。 */
+  function makeTestImage() {
+    try {
+      var c = document.createElement('canvas');
+      c.width = 720;
+      c.height = 140;
+      var x = c.getContext('2d');
+      x.fillStyle = '#000000';
+      x.fillRect(0, 0, c.width, c.height);
+      x.fillStyle = '#ffffff';
+      x.font = 'bold 36px Georgia, "Times New Roman", serif';
+      x.textAlign = 'center';
+      x.textBaseline = 'middle';
+      x.fillText('The quick brown fox jumps over the lazy dog.', c.width / 2, c.height / 2);
+      return c.toDataURL('image/jpeg', 0.85);
+    } catch (e) { return ''; }
+  }
+
+  $('testVision').addEventListener('click', function () {
+    var btn = this;
+    var out = $('visionOut');
+    var data = collect();
+
+    if (!data.apiKey) {
+      setStatus(out, '先把 API Key 填上。', 'err');
+      $('apiKey').focus();
+      return;
+    }
+
+    var img = makeTestImage();
+    if (!img) {
+      setStatus(out, '这台机器上生成测试图失败，读屏功能可能也用不了。', 'err');
+      return;
+    }
+
+    btn.disabled = true;
+    setStatus(out, '正在把测试图发给视觉接口…', 'busy');
+
+    dsSaveSettings(data, function () {
+      chrome.runtime.sendMessage({ type: 'ds-translate-image', image: img }, function (resp) {
+        btn.disabled = false;
+        if (chrome.runtime.lastError) {
+          setStatus(out, '扩展后台没响应：' + chrome.runtime.lastError.message, 'err');
+          return;
+        }
+        if (!resp || !resp.ok) {
+          setStatus(out, '失败：' + ((resp && resp.error) || '未知错误'), 'err');
+          return;
+        }
+        if (!resp.found) {
+          setStatus(out, '接口是通的，但模型说这张图里没读到文字。实际画面里字幕更清楚，可以先开着试。', 'busy');
+          return;
+        }
+        setStatus(out,
+          '通了。识别「' + String(resp.src).slice(0, 40) + '」→ 译文「' +
+          String(resp.zh).slice(0, 24) + '」，' + resp.elapsedMs + 'ms',
+          'ok');
       });
     });
   });

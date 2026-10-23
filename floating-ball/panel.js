@@ -15,7 +15,32 @@
   var K_EFFORT = '__ds_effort__';   // 思考强度（reasoning_effort：none / low / medium / high）
   var K_RECO = '__ds_imgreco__';    // 「推荐图片」开关（每轮回答末尾附几个配图搜索词）
   var K_SIZE = '__ds_size__';   // 面板几何：{ full:{w,h,left,top}, mini:{w,h,left,top} }
+  var K_LANG = '__ds_lang__';   // 界面语言 'zh' / 'en'（设置页和面板共用这一个键）
+
+  // ---------------- 界面语言 ----------------
+  // 面板文案走 i18n.js 那份词表（设置页用的是同一份）。规矩和那边一样：
+  //   · 中英各一份，某个 key 缺了就回落中文，**不会把 key 本身露到界面上**；
+  //   · {name} 是占位符，调用方把值传进来替换；
+  //   · 只翻"用户眼睛看得到的" —— 拼进请求体的那些标记（【附件 …】/【当前网页：…】）
+  //     一律不动：它们是喂给模型的，跟着界面语言变会让模型看到中英混杂的上下文。
+  var LANG = 'zh';
+  function tr(key, vars, dflt) {
+    var D = window.DS_I18N || {};
+    var pack = (LANG === 'en' && D.en) ? D.en : (D.zh || {});
+    var s = pack[key];
+    if (typeof s !== 'string') { s = (D.zh || {})[key]; }   // 缺词回落中文
+    if (typeof s !== 'string') {                            // 两边都缺：用调用方给的兜底文案
+      return typeof dflt === 'string' ? dflt : String(key);
+    }
+    return String(s).replace(/\{(\w+)\}/g, function (m, k) {
+      var v = vars ? vars[k] : null;
+      return v == null ? m : String(v);
+    });
+  }
   // 拉角能拉到多小（全窗 / 小窗），比默认尺寸小，但不能小到工具条挤成一团
+  // 默认标题是**存储里的固定值**，用来判断"这条还没起名"。它不随界面语言变 ——
+  // 变的话（比如英文下写成 "New chat"）老记录和判断逻辑都会对不上。
+  var NEW_TITLE = '新对话';
   var MIN_W = { full: 300, mini: 240 };
   var MIN_H = { full: 320, mini: 240 };
 
@@ -34,15 +59,40 @@
   var IMG_MAX_SIDE = 1536;              // 压缩后最长边（官方会把图缩到约 1300×1300，压到这里不亏）
   var IMG_QUALITY = 0.85;               // 压缩成 JPEG 的质量
   var KEEP_PNG_BELOW = 2e6;             // 小于这个体积的 PNG 保留原样（可能有透明通道）
-  // 图片快捷提示词（config.js）：按钮文字，以及要不要"图片一进附件就自动填"
-  var IMG_PROMPT = (typeof cfg.imagePrompt === 'string') ? cfg.imagePrompt : '这是什么？';
+  // 图片快捷提示词（config.js）：按钮文字，以及要不要"图片一进附件就自动填"。
+  // 英文界面下，**只有还用着默认那句**才换成词表里的英文 —— 用户自己改过 config 的那句
+  // 一定原样保留（他写的就是他要的，我们没资格替他翻译）。
+  var IMG_PROMPT_CFG = (typeof cfg.imagePrompt === 'string') ? cfg.imagePrompt : '这是什么？';
+  var IMG_PROMPT = IMG_PROMPT_CFG;
+  function syncImgPromptText() {
+    IMG_PROMPT = (LANG === 'en' && IMG_PROMPT_CFG === '这是什么？') ? tr('p.imgPrompt') : IMG_PROMPT_CFG;
+  }
   var IMG_PROMPT_AUTO = !!cfg.autoFillImagePrompt;
   var MAX_PAGE = 60000;                 // 抓网页正文的上限（字符），超出截断
-  // 历史对话发给模型的预算。超了接口会直接甩一个"上下文超长"，那种报错基本看不懂，
-  // 而且是在聊得正投入的时候炸 —— 所以宁可在本地先掐住。
-  // 中文按 1 字≈1 token 粗估，这里留足余量。KEEP_RECENT 是硬下限：
-  // 哪怕一条消息就吃满预算，最近这几条也一定带上，否则连"你刚才说的那个"都答不了。
-  var MAX_CTX_CHARS = 80000;
+  // 历史对话发给模型的预算（字符）。KEEP_RECENT 是硬下限：哪怕一条消息就吃满预算，
+  // 最近这几条也一定带上，否则连"你刚才说的那个"都答不了。
+  //
+  // 为什么是 30 万（2026-10-08 改，依据官方现行文档）：
+  //   ① 上下文上限其实是 **1M token**，30 万中文字符≈20 万 token，还留着 4 倍余量。
+  //      原来那个 8 万离上限差 20 倍 —— 它根本没在防"上下文超长"报错，是白紧张。
+  //   ② 更要命的是**缓存**：命中价 $0.003/M、未命中 $0.15/M，**差 50 倍**；
+  //      而命中的条件是"前缀要完整匹配一个 cache unit"（官方 kv_cache 文档）。
+  //      原来一超预算就从**头部**丢消息 → 前缀整体错位 → 此后每一轮**全按未命中价**计费。
+  //      「砍历史」看着是省 token，实际把缓存打碎了，反而贵得多。
+  //   ③ 代价只是请求体大一点：30 万字符≈0.9MB，本地上传不到一秒。
+  var MAX_CTX_CHARS = 300000;
+  // 超预算要从第几条开始带，算出来的下标再**按这个数取整**（见 ctxWindow）。
+  //
+  // 上面②只说了一半："从头部丢消息会让前缀错位"。真正难缠的是**持续性** ——
+  // 对话一旦越过 MAX_CTX_CHARS，每轮都会新增长度，于是**每一轮都得再往前丢一点**，
+  // 起始下标每轮都在动 → 请求前缀每轮都在变 → 缓存从那一刻起**永久 0 命中**，
+  // 整段历史全按未命中价计费（和命中差 50 倍）。"砍历史"省下来的那点 token，
+  // 远不如把缓存打碎亏得多。
+  //
+  // 取整就是解药：每轮下标只挪 1~2 条，取整到 8 的倍数之后**连续好几轮落在同一档**，
+  // 这几轮的请求层层嵌套（上一轮的整个请求就是这一轮的前缀）→ 缓存整段命中；
+  // 只有跨档那一轮要重来。代价是取整会多丢几条历史（最多 7 条），完全值。
+  var CTX_CHUNK = 8;
   var KEEP_RECENT = 12;
   // 历史里**还带图**的消息条数上限。官方一张图最多算 1024 token，钱其实不多，
   // 但一张图压完也是几万字符的 data URL，每轮把老图重发一遍纯粹是在撑大请求体、拖慢上传。
@@ -73,6 +123,8 @@
     dead: {},          // 本会话里删掉的对话 id。合并写盘时要把它们排除，否则会被磁盘版本"救回来"
     seen: {},          // 在存储里见过的对话 id（= 至少被写过一次）。用来判断"别处把它删了"
     syncPending: false,// 正在吐字时收到别的窗口的写入 → 先记下，等这一轮结束再对齐
+    histIdx: -1,       // 输入框里按 ↑ 翻自己发过的话，翻到第几条（-1 = 没在翻）
+    histDraft: '',     // 开始翻历史之前输入框里那半句话，翻回底部时原样还给你
     fs: false,         // 是否全屏（每次打开都从非全屏开始）
     preFs: null,       // 进全屏前的大小，退出时还原
     size: null         // 存在本地存储里的自定义尺寸
@@ -146,10 +198,12 @@
           return {
             mid: m.mid,          // 消息的身份：两个窗口合并时靠它认"这条是不是同一条"
             role: m.role,
+            ts: m.ts,            // 什么时候说的（一个数字，比 reasoning 还小）
             content: m.content,
             show: m.show,
             reasoning: m.reasoning,
-            attachments: m.attachments
+            attachments: m.attachments,
+            usage: m.usage     // 这一轮的用量（几个数字，比 reasoning 还小）：重开面板还能看见"当时花了多少"
           };
         })
       };
@@ -249,9 +303,9 @@
       // 标题取"后动过的那份"；**正文取两边的并集** ——
       // 以前是整条二选一，所以两个窗口都往同一个对话里打字时，后写的那份会把对方刚说的吃掉。
       var title = tt > mt ? (c.title || m.title) : (m.title || c.title);
-      if (!title || title === '新对话') {
-        var alt = (m.title && m.title !== '新对话') ? m.title
-          : ((c.title && c.title !== '新对话') ? c.title : '');
+      if (!title || title === NEW_TITLE) {
+        var alt = (m.title && m.title !== NEW_TITLE) ? m.title
+          : ((c.title && c.title !== NEW_TITLE) ? c.title : '');
         if (alt) { title = alt; }
       }
       var out = {
@@ -402,16 +456,14 @@
   function syncReco() {
     if (!el.reco) { return; }
     el.reco.classList.toggle('on', !!state.recoImg);
-    el.reco.title = state.recoImg
-      ? '已开启：每轮回答末尾会附几个配图搜索词，点一下关掉'
-      : '点一下开 / 关：开启后每轮回答末尾推荐几个配图搜索词';
+    el.reco.title = state.recoImg ? tr('p.recoOn') : tr('p.recoOff');
   }
   // 没配 Key 时把 ⚙ 点亮，不然用户只会在按发送的那一刻才知道缺东西
   function syncKeyHint() {
     if (!el.set) { return; }
     var missing = cfg.requireKey !== false && !apiKey();
     el.set.classList.toggle('warn', missing);
-    el.set.title = missing ? '还没配 API Key —— 点这里去设置' : '设置（API Key）';
+    el.set.title = missing ? tr('p.settingsWarn') : tr('p.settings');
   }
   function openSettings() {
     try {
@@ -419,12 +471,12 @@
         // 新 Chrome 里它返回 Promise：失败了别静默 —— 这条是配 Key 的唯一入口
         var p = chrome.runtime.openOptionsPage();
         if (p && p.catch) {
-          p.catch(function () { toast('打开设置页失败：去 chrome://extensions → 本扩展 → 扩展选项'); });
+          p.catch(function () { toast(tr('p.settingsFail')); });
         }
         return;
       }
     } catch (e) { /* 下面兜底 */ }
-    toast('打开扩展详情页 → 点「扩展选项」就能配 Key');
+    toast(tr('p.settingsAlt'));
   }
   // ---------------- 账户余额 ----------------
   // 官方有个只读接口：GET /user/balance，返回
@@ -443,14 +495,14 @@
     var base = String(cfg.apiBase || 'https://api.deepseek.com').replace(/\/+$/, '');
     var key = apiKey();
     if (!key) {
-      toast('还没配 API Key：点右上角那个 ⚙ 填一下');
+      toast(tr('p.needKey'));
       return Promise.resolve(null);
     }
     return fetch(base + '/user/balance', { headers: { 'Authorization': 'Bearer ' + key } })
       .then(function (res) {
         if (!res.ok) {
-          var why = res.status === 401 ? '（Key 不对：⚙ 里换一把）'
-            : res.status === 404 ? '（这个接口没有，可能是自建网关）'
+          var why = res.status === 401 ? tr('p.bal401')
+            : res.status === 404 ? tr('p.bal404')
             : '';
           throw new Error('HTTP ' + res.status + ' ' + why);
         }
@@ -458,18 +510,18 @@
       })
       .then(function (j) {
         var infos = (j && j.balance_infos) || [];
-        if (!infos.length) { throw new Error('接口没返回余额数据'); }
+        if (!infos.length) { throw new Error(tr('p.balNoData')); }
         return { available: !(j && j.is_available === false), infos: infos };
       })
       .catch(function (e) {
-        toast('查余额失败：' + ((e && e.message) || e));
+        toast(tr('p.balFail', { err: (e && e.message) || e }));
         return null;
       });
   }
 
   function showBalance(btn) {
     if (btn) { btn.disabled = true; }
-    toast('正在查余额…');
+    toast(tr('p.balChecking'));
     fetchBalance().then(function (b) {
       if (btn) { btn.disabled = false; }
       if (!b) { return; }
@@ -477,11 +529,11 @@
       var extra = [];
       var first = b.infos[0] || {};
       var g = Number(first.granted_balance), t = Number(first.topped_up_balance);
-      if (isFinite(t) && t > 0) { extra.push('充值 ' + symOf(first.currency) + fmtMoney(first.topped_up_balance)); }
-      if (isFinite(g) && g > 0) { extra.push('赠送 ' + symOf(first.currency) + fmtMoney(first.granted_balance)); }
-      toast('余额 ' + parts.join(' / ') +
-        (extra.length ? '（' + extra.join(' · ') + '）' : '') +
-        (b.available ? '' : ' · 账户当前不可用'));
+      if (isFinite(t) && t > 0) { extra.push(tr('p.balTopup', { v: symOf(first.currency) + fmtMoney(first.topped_up_balance) })); }
+      if (isFinite(g) && g > 0) { extra.push(tr('p.balGranted', { v: symOf(first.currency) + fmtMoney(first.granted_balance) })); }
+      toast(tr('p.balLine', { v: parts.join(' / ') }) +
+        (extra.length ? tr('p.balExtra', { v: extra.join(' · ') }) : '') +
+        (b.available ? '' : tr('p.balUnavailable')));
     });
   }
 
@@ -493,6 +545,10 @@
       chrome.storage.onChanged.addListener(function (changes, area) {
         if (area !== 'local' || !changes) { return; }
         if (changes[K_KEY]) { loadKey().then(syncKeyHint); }
+        // 在设置页换了界面语言：已经建过面板就当场重建（没建过的话，下次打开自然就是新语言）
+        if (changes[K_LANG]) {
+          applyLang(changes[K_LANG].newValue === 'en' ? 'en' : 'zh');
+        }
         if (changes[K_CHATS]) {
           var ch = changes[K_CHATS] || {};
           // newValue 不是数组就当没收到（存储里那条被整个清掉了，别当成"别处把对话全删了"）
@@ -697,7 +753,8 @@
         var code = parts[i].replace(/^[a-zA-Z0-9_+.#-]*\r?\n/, '');
         // 代码块套一层 wrapper：复制按钮相对它定位，这样 pre 自己横向滚动时不带着按钮跑。
         // 按钮不在这里绑事件（这函数每次渲染都重跑）——统一由 root 上的委托处理。
-        out += '<div class="codewrap"><button class="cp cp-code" type="button" title="复制这段代码">复制</button>'
+        out += '<div class="codewrap"><button class="cp cp-code" type="button" title="' +
+          tr('p.codeCopyTitle') + '">' + tr('p.copy') + '</button>'
              + '<pre><code>' + esc(code.replace(/\s+$/, '')) + '</code></pre></div>';
       } else {
         out += mdBlocks(parts[i]);
@@ -816,11 +873,11 @@
     function flash(ok) {
       if (!btn) { return; }
       btn.classList.toggle('done', !!ok);
-      btn.textContent = ok ? '已复制' : '复制失败';
+      btn.textContent = ok ? tr('p.copied') : tr('p.copyFail');
       clearTimeout(btn._cpT);
       btn._cpT = setTimeout(function () {
         btn.classList.remove('done');
-        btn.textContent = '复制';
+        btn.textContent = tr('p.copy');
       }, 1400);
     }
     function legacy() {
@@ -836,20 +893,20 @@
         return ok;
       } catch (e) { return false; }
     }
-    if (!text) { flash(false); toast('这条没内容可复制'); return; }
+    if (!text) { flash(false); toast(tr('p.copyNothing')); return; }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(function () {
         flash(true);
       }).catch(function () {
         var ok = legacy();
         flash(ok);
-        if (!ok) { toast('复制失败，手动选一下吧'); }
+        if (!ok) { toast(tr('p.copyManual')); }
       });
       return;
     }
     var ok2 = legacy();
     flash(ok2);
-    if (!ok2) { toast('复制失败，手动选一下吧'); }
+    if (!ok2) { toast(tr('p.copyManual')); }
   }
 
   function toast(msg) {
@@ -866,7 +923,14 @@
     return (d.getMonth() + 1) + '/' + d.getDate();
   }
   function newChat() {
-    return { id: uid(), title: '新对话', messages: [], updatedAt: Date.now() };
+    return { id: uid(), title: NEW_TITLE, messages: [], updatedAt: Date.now() };
+  }
+
+  // 对话在界面上显示的名字：空标题 / 默认标题都按当前语言取词。
+  // 存的是固定值（见 NEW_TITLE），只在这里换 —— 否则英文界面里会冒出一句中文。
+  function titleText(c) {
+    var v = c && c.title ? String(c.title) : '';
+    return (!v || v === NEW_TITLE) ? tr('p.newChat') : v;
   }
 
   // 从存储里读回来的对话，字段不一定齐（手改过、或者旧版本写的），
@@ -880,14 +944,16 @@
         if (m.role !== 'user' && m.role !== 'assistant') { return; }
         var o = { role: m.role, show: typeof m.show === 'string' ? m.show : '', content: typeof m.content === 'string' ? m.content : '' };
         if (typeof m.mid === 'string' && m.mid) { o.mid = m.mid; }
+        if (typeof m.ts === 'number' && m.ts) { o.ts = m.ts; }
         if (typeof m.reasoning === 'string') { o.reasoning = m.reasoning; }
         if (Array.isArray(m.attachments)) { o.attachments = m.attachments; }
+        if (m.usage && typeof m.usage === 'object') { o.usage = m.usage; }
         msgs.push(o);
       });
     }
     var out = {
       id: typeof c.id === 'string' && c.id ? c.id : uid(),
-      title: (typeof c.title === 'string' && c.title) ? c.title : '新对话',
+      title: (typeof c.title === 'string' && c.title) ? c.title : NEW_TITLE,
       messages: msgs,
       updatedAt: (typeof c.updatedAt === 'number' && c.updatedAt) ? c.updatedAt : Date.now()
     };
@@ -999,6 +1065,9 @@
     '.cp:hover{opacity:1 !important;background:rgba(0,0,0,.18)}',
     '.cp.done{opacity:1;color:#0f6e56;background:rgba(29,158,117,.2)}',
     '.cp-msg{top:7px;right:9px}',
+    // 「重试」挨着「复制」摆——**写在 .cp-msg 后面**才生效：两条选择器权重一样，
+    // 谁在后面谁说了算。right:52px 正好让两个小按钮并排不打架。
+    '.cp-retry{top:7px;right:52px}',
     // 「回到这里」用同一套：浮在用户气泡右上角，hover 才显形
     '.cp-back{top:7px;right:9px}',
     // 回滚的二次确认：丢消息不可逆，用面板自己的确认层。
@@ -1028,6 +1097,9 @@
     // 「推荐图片」那一行（在气泡底部）：一个「配图」+ 几个可点的搜索词。
     // 默认 display:none —— 模型没给词时它根本不该占位置（renderReco 里判断后才显示）。
     '.reco{display:none;flex-wrap:wrap;align-items:center;gap:5px;margin-top:9px}',
+    '.usage{font-size:11px;opacity:.5;margin-top:7px;letter-spacing:.2px;cursor:default}',
+    // 气泡底部那行时间：比用量更轻，因为它只是"什么时候"，不承载信息
+    '.time{font-size:11px;opacity:.32;margin-top:5px;letter-spacing:.2px;cursor:default}',
     '.reco-lab{font-size:11px;opacity:.5}',
     '.reco-k{font-size:11.5px;line-height:1.7;padding:1px 9px;border-radius:9px;text-decoration:none;',
     'background:rgba(77,107,254,.12);color:#3b58d6;white-space:nowrap;max-width:100%;overflow:hidden;',
@@ -1079,6 +1151,12 @@
     '.drawer.open{transform:none}',
     '.dhead{display:flex;align-items:center;justify-content:space-between;padding:12px 12px 10px;font-size:13px;font-weight:500;border-bottom:1px solid rgba(0,0,0,.06)}',
     '.tb{border:0;background:rgba(77,107,254,.13);color:#3b58d6;font:inherit;font-size:12px;padding:5px 10px;border-radius:8px;cursor:pointer}',
+    // 历史搜索：对话攒多了以后，靠一条条往下滚是找不到东西的。过滤是纯前端的（数据本来就在内存里）
+    '.dsearch{padding:0 10px 9px}',
+    '.dsearch input{width:100%;box-sizing:border-box;font:inherit;font-size:12.5px;padding:6px 10px;border-radius:8px;',
+    'border:1px solid rgba(0,0,0,.13);background:rgba(0,0,0,.03);color:inherit;outline:none}',
+    '.dsearch input:focus{border-color:rgba(77,107,254,.55);background:rgba(77,107,254,.05)}',
+    '.dsearch input::placeholder{opacity:.42}',
     '.dlist{flex:1;overflow-y:auto;padding:6px}',
     // 抽屉底部：导出 / 清理。平时不打扰，需要的时候就在手边。
     '.dfoot{display:flex;gap:6px;padding:9px 10px;border-top:1px solid rgba(0,0,0,.06)}',
@@ -1113,6 +1191,8 @@
     '.box{background:#232428;border-color:rgba(255,255,255,.16)}',
     '.drawer{background:#1c1d20;border-right-color:rgba(255,255,255,.1)}',
     '.dhead{border-bottom-color:rgba(255,255,255,.08)}',
+    '.dsearch input{border-color:rgba(255,255,255,.15);background:rgba(255,255,255,.06)}',
+    '.dsearch input:focus{border-color:rgba(120,150,255,.65);background:rgba(77,107,254,.14)}',
     '.dfoot{border-top-color:rgba(255,255,255,.08)}',
     '.hitem:hover{background:rgba(255,255,255,.07)}',
     '.atts span{background:rgba(255,255,255,.09)}',
@@ -1146,47 +1226,48 @@
       + '<style>' + CSS + '</style>'
       + '<div class="wrap">'
       + '  <div class="bar">'
-      + '    <button class="ib" id="history" title="历史记录">' + ICONS.history + '</button>'
+      + '    <button class="ib" id="history" title="' + tr('p.history') + '">' + ICONS.history + '</button>'
       + '    <div class="ttl"><b>' + esc(A.name || 'DeepSeek') + '</b><span id="mtag"></span></div>'
-      + '    <button class="ib" id="fs" title="全屏">' + ICONS.expand + '</button>'
-      + '    <button class="ib" id="bal" title="查看账户余额">' + ICONS.wallet + '</button>'
-      + '    <button class="ib" id="set" title="设置（API Key）">' + ICONS.gear + '</button>'
-      + '    <button class="ib" id="del" title="删除当前对话">' + ICONS.trash + '</button>'
-      + '    <button class="ib" id="exit" title="退出">' + ICONS.close + '</button>'
+      + '    <button class="ib" id="fs" title="' + tr('p.full') + '">' + ICONS.expand + '</button>'
+      + '    <button class="ib" id="bal" title="' + tr('p.balance') + '">' + ICONS.wallet + '</button>'
+      + '    <button class="ib" id="set" title="' + tr('p.settings') + '">' + ICONS.gear + '</button>'
+      + '    <button class="ib" id="del" title="' + tr('p.delChat') + '">' + ICONS.trash + '</button>'
+      + '    <button class="ib" id="exit" title="' + tr('p.exit') + '">' + ICONS.close + '</button>'
       + '  </div>'
       + '  <div class="list" id="list"></div>'
       + '  <div class="box">'
       + '    <div class="chips" id="chips"></div>'
       + '    <div class="toprow">'
-      + '      <button class="pill" id="page" title="让对话阅读当前网页">应用网页</button>'
-      + '      <button class="pill" id="imgprompt" title="填入快捷提示词"></button>'
-      + '      <button class="pill" id="reco" title="点一下开 / 关：开启后每轮回答末尾推荐几个配图搜索词">推荐图片</button>'
+      + '      <button class="pill" id="page" title="' + tr('p.pageOffTitle') + '">' + tr('p.page') + '</button>'
+      + '      <button class="pill" id="imgprompt" title="' + tr('p.imgPromptTitle') + '"></button>'
+      + '      <button class="pill" id="reco" title="' + tr('p.recoOff') + '">' + tr('p.recoLabel') + '</button>'
       + '    </div>'
-      + '    <textarea id="input" rows="1" placeholder="畅所欲问" spellcheck="false"></textarea>'
+      + '    <textarea id="input" rows="1" placeholder="' + tr('p.placeholder') + '" spellcheck="false"></textarea>'
       + '    <div class="tools">'
-      + '      <label class="ib small" title="加附件（文本/图片）。截图不用存文件，在面板里直接 Ctrl+V 粘贴就行"><input type="file" id="file" multiple hidden>' + ICONS.clip + '</label>'
-      + '      <select id="effort" title="思考强度：不思考最快，思考·高最稳"></select>'
+      + '      <label class="ib small" title="' + tr('p.attachTitle') + '"><input type="file" id="file" multiple hidden>' + ICONS.clip + '</label>'
+      + '      <select id="effort" title="' + tr('p.effortTitle') + '"></select>'
       + '      <select id="models"></select>'
-      + '      <button class="send" id="send" title="发送">' + ICONS.send + '</button>'
+      + '      <button class="send" id="send" title="' + tr('p.send') + '">' + ICONS.send + '</button>'
       + '    </div>'
       + '  </div>'
-      + '  <p class="note">结果由 AI 大模型生成，请核实后使用</p>'
+      + '  <p class="note">' + tr('p.note') + '</p>'
       + '  <div class="drawer" id="drawer">'
-      + '    <div class="dhead"><span>历史记录</span><button class="tb" id="new">新对话</button></div>'
+      + '    <div class="dhead"><span>' + tr('p.history') + '</span><button class="tb" id="new">' + tr('p.newChat') + '</button></div>'
+      + '    <div class="dsearch"><input id="dq" type="text" placeholder="' + tr('p.searchPh') + '" spellcheck="false"></div>'
       + '    <div class="dlist" id="dlist"></div>'
       + '    <div class="dfoot">'
-      + '      <button class="tb" id="exp" title="把所有对话导出成一个 markdown 文件（存到下载文件夹）">导出 md</button>'
-      + '      <button class="tb" id="cln" title="删掉超过 ' + CLEAN_DAYS + ' 天的对话（会先问你一次）">清理旧对话</button>'
+      + '      <button class="tb" id="exp" title="' + tr('p.exportTitle') + '">' + tr('p.export') + '</button>'
+      + '      <button class="tb" id="cln" title="' + tr('p.cleanTitle', { n: CLEAN_DAYS }) + '">' + tr('p.clean') + '</button>'
       + '    </div>'
       + '  </div>'
       + '  <div class="toast" id="toast"></div>'
       + '  <div class="viewer" id="viewer"><img id="vimg" alt=""><div class="cap" id="vcap"></div></div>'
       + '  <div class="cfm" id="cfm">'
       + '    <div class="t" id="cfm-t"></div><div class="m" id="cfm-m"></div>'
-      + '    <div class="btns"><button class="danger" id="cfm-yes">丢掉，重来</button>'
-      + '    <button id="cfm-no">算了</button></div>'
+      + '    <div class="btns"><button class="danger" id="cfm-yes">' + tr('p.discard') + '</button>'
+      + '    <button id="cfm-no">' + tr('p.cancel') + '</button></div>'
       + '  </div>'
-      + '  <div class="grip" id="grip" title="拖动改变大小"></div>'
+      + '  <div class="grip" id="grip" title="' + tr('p.grip') + '"></div>'
       + '</div>';
 
     el = {
@@ -1207,6 +1288,7 @@
       grip: root.querySelector('#grip'),
       bar: root.querySelector('.bar'),
       drawer: root.querySelector('#drawer'),
+      dq: root.querySelector('#dq'),
       dlist: root.querySelector('#dlist'),
       toast: root.querySelector('#toast'),
       tag: root.querySelector('#mtag'),
@@ -1244,10 +1326,15 @@
     });
 
     root.querySelector('#history').addEventListener('click', function () { el.drawer.classList.toggle('open'); });
+    // 历史搜索：输入即过滤。数据本来就在内存里（state.chats），纯前端筛，不打接口。
+    el.dq.addEventListener('input', function () { renderHistory(); });
     root.querySelector('#new').addEventListener('click', function () {
       state.cur = newChat();
       state.chats.unshift(state.cur);
       state.atts = [];
+      state.histIdx = -1;          // 换对话了，↑ 翻历史的状态跟着归零
+      // 同上：新对话的标题是"新对话"，留在过滤里它自己都显示不出来
+      if (el.dq) { el.dq.value = ''; }
       persist();
       renderChips();
       renderAll();
@@ -1268,12 +1355,12 @@
         persist();
         renderAll();
         renderHistory();
-        toast('已删除');
+        toast(tr('p.deleted'));
       };
       if (!c.messages.length) { go(); return; }
-      askConfirm('删除这个对话？',
-        '「' + (c.title || '新对话') + '」共 ' + c.messages.length + ' 条，删掉就找不回来了。',
-        '删掉', go);
+      askConfirm(tr('p.delQ'),
+        tr('p.delBody', { t: titleText(c), n: c.messages.length }),
+        tr('p.delDo'), go);
     });
     root.querySelector('#exp').addEventListener('click', function () { exportAll(); });
     root.querySelector('#cln').addEventListener('click', function () { askClean(); });
@@ -1313,9 +1400,19 @@
       if (fn) { fn(); }
     });
     el.input.addEventListener('keydown', function (e) {
-      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); return; }
+      // ↑ / ↓ 翻自己发过的话（像终端那样）。只在"光标在第一行 / 最后一行"时才接管 ——
+      // 输入框是多行的，正在中间改字时按方向键，你要的是移动光标，不是翻历史。
+      if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+          !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+        if (recallHistory(e.key === 'ArrowUp' ? -1 : 1)) { e.preventDefault(); }
+      }
     });
-    el.input.addEventListener('input', autoGrow);
+    el.input.addEventListener('input', function () {
+      // 手打一个字就退出"翻历史"状态 —— 否则下一次按 ↑ 会从奇怪的偏移接着翻
+      state.histIdx = -1;
+      autoGrow();
+    });
     el.file.addEventListener('change', function () { addFiles(el.file.files); el.file.value = ''; });
     el.page.addEventListener('click', function () {
       // togglePageCtx 现在是异步的（要等标签页回话）。这里兜一下，别让异常变成控制台里
@@ -1323,7 +1420,7 @@
       Promise.resolve(togglePageCtx()).catch(function (e) {
         state.pageMode = null;
         renderChips();
-        toast('这个页面读不了（' + ((e && e.message) || e) + '）');
+        toast(tr('p.pageCant', { why: (e && e.message) || e }));
       });
     });
     el.imgPrompt.addEventListener('click', function () { toggleImagePrompt(); });
@@ -1333,9 +1430,7 @@
       state.recoImg = !state.recoImg;
       syncReco();
       save(K_RECO, state.recoImg);
-      toast(state.recoImg
-        ? '已开启：每轮回答末尾会给几个能搜到配图的词（点一下关掉）'
-        : '已关闭推荐图片');
+      toast(state.recoImg ? tr('p.recoOnToast') : tr('p.recoOffToast'));
     });
     el.models.addEventListener('change', function () {
       state.model = el.models.value;   // 这里是 id
@@ -1355,6 +1450,55 @@
     el.input.style.height = 'auto';
     el.input.style.height = Math.min(el.input.scrollHeight, 120) + 'px';
     syncImgPromptBtn();
+  }
+
+  function caretToEnd() {
+    try { el.input.setSelectionRange(el.input.value.length, el.input.value.length); } catch (e) {}
+  }
+
+  // 输入框里按 ↑ / ↓ 翻自己发过的话（跟终端一个手感）。
+  // 翻的是 `show` —— 也就是**你在气泡里看到的那句**。content 里塞着网页正文和附件全文，
+  // 把那玩意儿填回输入框就没法看了。
+  // 返回 true = "这一下我接管了"，调用方要 preventDefault 把光标移动挡掉；
+  // 返回 false = 这一下让给光标（比如你在多行文字中间上下挪）。
+  function recallHistory(dir) {
+    if (!el.input) { return false; }
+    var v = el.input.value;
+    var caret = el.input.selectionStart;
+    // 多行输入框的礼貌：↑ 只在**第一行**、↓ 只在**最后一行**时才翻历史，
+    // 其余情况把方向键让给光标。不然在一个长段中间想上下移动就全乱了。
+    if (dir < 0) { if (v.slice(0, caret).indexOf('\n') >= 0) { return false; } }
+    else { if (v.slice(caret).indexOf('\n') >= 0) { return false; } }
+
+    var mine = (state.cur ? state.cur.messages : []).filter(function (m) {
+      return m.role === 'user' && (m.show || '').trim();
+    }).map(function (m) { return m.show; });
+    if (!mine.length) { return false; }
+
+    var i = state.histIdx;
+    if (dir < 0) {
+      if (i < 0) {                 // 第一次按 ↑：先把草稿存起来，从最新一条往回翻
+        state.histDraft = v;
+        i = mine.length;
+      }
+      if (i === 0) { return true; }  // 已经翻到最早那条：吃掉这一下，什么都不做（别跳出到别的地方）
+      i -= 1;
+    } else {
+      if (i < 0) { return false; }   // 没在翻历史 → ↓ 该正常移动光标
+      if (i >= mine.length - 1) {    // 已经翻过最新一条 → 把刚才那半句还给你
+        state.histIdx = -1;
+        el.input.value = state.histDraft || '';
+        caretToEnd();
+        autoGrow();
+        return true;
+      }
+      i += 1;
+    }
+    state.histIdx = i;
+    el.input.value = mine[i];
+    caretToEnd();
+    autoGrow();
+    return true;
   }
 
   // 输入框最后一行正好是那句提示词（按钮点亮 / 再点收回都以它为准）
@@ -1437,23 +1581,51 @@
     if (!el.effort) { return; }
     var list = effortList();
     var has = function (id) { return list.some(function (m) { return m.id === id; }); };
+    // 先把老档位名（medium / xhigh 这类）换算成官方真值，否则会存着一个下拉框里根本没有的 id
+    var mig = effortId(state.effort);
+    if (mig !== state.effort) { state.effort = mig; save(K_EFFORT, mig); }
     if (!has(state.effort)) { state.effort = list[0].id; save(K_EFFORT, state.effort); }
     el.effort.textContent = '';
     list.forEach(function (m) {
       var o = document.createElement('option');
       o.value = m.id;
-      o.textContent = m.label;
+      // 文案默认取 config.js 的 label（用户可能自己改过）；只有英文界面才用词表顶替，
+      // 词表里没有这个 id 时仍然回落 config 的写法。
+      o.textContent = LANG === 'en' ? tr('p.effort.' + m.id, null, m.label) : m.label;
       o.title = m.id;
       el.effort.appendChild(o);
     });
     el.effort.value = state.effort;
   }
 
-  // 把思考强度塞进请求体。选"不思考"时发的是 reasoning_effort:'none' —— 那才是真的
-  // 关掉思考（接口默认是会思考的，不传参数不等于关）。
+  // 把思考强度塞进请求体。
+  // ⚠ 依官方现行文档（thinking mode），OpenAI 格式下有两个坑：
+  //   ① reasoning_effort **只认 low / high / max**；「关思考」不是发 none（那个值不在合法
+  //      列表里，会被**静默忽略**，模型照旧按默认档思考 —— 钱照花、还慢），
+  //      正确写法是 thinking:{type:'disabled'}。
+  //   ② thinking **默认就是开着的**：不传任何参数 = 默认 high，不等于"不思考"。
+  //      而且档位映射表里 requested 的 medium / xhigh 都会被**归到 high** ——
+  //      所以界面上不能摆一个叫"中"的档，那是在骗人（实际跑的是"高"）。
   function withEffort(body) {
-    if (state.effort) { body.reasoning_effort = state.effort; }
+    var e = effortId(state.effort);
+    if (e === 'none') {
+      body.thinking = { type: 'disabled' };
+      return body;          // 关思考时不发 reasoning_effort：两个字段同时出现没有意义
+    }
+    body.thinking = { type: 'enabled' };
+    body.reasoning_effort = e;
     return body;
+  }
+
+  // 把存下来的档位名换算成官方真值（照官方映射表）。老配置里的 'medium' 实际就是按 high
+  // 跑的，这里换算成 'high' —— 行为一点不变，只是下拉框里不再显示一个骗人的"中"。
+  // 认不出来的原样返回，交给接口自己判断。
+  function effortId(id) {
+    var s = String(id || '');
+    if (s === 'medium' || s === 'xhigh') { return 'high'; }
+    if (s === 'minim') { return 'low'; }
+    if (s === 'ultramax') { return 'max'; }
+    return s || 'none';
   }
 
   function setModelTag(label) {
@@ -1508,7 +1680,7 @@
     m.$reco.style.display = 'flex';
     var lab = document.createElement('span');
     lab.className = 'reco-lab';
-    lab.textContent = '配图';
+    lab.textContent = tr('p.recoLabel');
     m.$reco.appendChild(lab);
     m.$reco.appendChild(document.createTextNode(''));
     keys.forEach(function (k) {
@@ -1520,7 +1692,7 @@
       a.href = imgSearchUrl(k);
       a.target = '_blank';
       a.rel = 'noopener';
-      a.title = '搜「' + k + '」的图片';
+      a.title = tr('p.recoSearch', { q: k });
       m.$reco.appendChild(a);
     });
   }
@@ -1530,7 +1702,7 @@
     var d = document.createElement('div');
     d.className = 'empty';
     d.innerHTML = '<div class="mark">' + (el.mark || '') + '</div>'
-      + '<p>' + esc(A.name || 'AI') + ' 在这儿<br>直接问，或者把文件丢进来</p>';
+      + '<p>' + tr('p.emptyLine').replace('{name}', esc(A.name || 'AI')) + '</p>';
     el.list.appendChild(d);
   }
 
@@ -1542,6 +1714,41 @@
     } else {
       m.$think.style.display = 'none';
     }
+  }
+
+  // 把 token 数缩成好读的样子：1234 → 1.2k
+  function fmtTok(n) {
+    n = Number(n) || 0;
+    if (n < 1000) { return String(n); }
+    if (n < 10000) { return (n / 1000).toFixed(1) + 'k'; }
+    return Math.round(n / 1000) + 'k';
+  }
+
+  // 这一轮的实际用量：输入多少、其中缓存命中多少、输出多少、思考占了多少。
+  // 为什么值得画出来：
+  //   · 缓存命中和未命中**差 50 倍**（$0.003 vs $0.15 每百万 token），命中率是唯一值得盯的数；
+  //   · 「思考」那一项是**关思考到底有没有生效的判据** —— 档位选"不思考"时它必须是 0，
+  //     不是 0 就说明参数没被服务端认（官方文档：reasoning_effort 合法值只有 low/high/max）。
+  // 没有 usage 就整行藏起来（老记录、请求失败、或者接口没给这字段）。
+  function syncUsage(m) {
+    if (!m.$usage) { return; }
+    var u = m.usage;
+    if (!u || typeof u !== 'object') { m.$usage.style.display = 'none'; return; }
+    var hit = Number(u.prompt_cache_hit_tokens) || 0;
+    var miss = Number(u.prompt_cache_miss_tokens) || 0;
+    var pt = Number(u.prompt_tokens) || (hit + miss);
+    var ct = Number(u.completion_tokens) || 0;
+    var rs = (u.completion_tokens_details && Number(u.completion_tokens_details.reasoning_tokens)) || 0;
+    var parts = [tr('p.inTok') + ' ' + fmtTok(pt)];
+    if (hit || miss) { parts.push(tr('p.hitTok') + ' ' + fmtTok(hit)); }
+    parts.push(tr('p.outTok') + ' ' + fmtTok(ct));
+    if (rs) { parts.push(tr('p.thinkTok') + ' ' + fmtTok(rs)); }
+    m.$usage.textContent = parts.join(' · ');
+    m.$usage.title = tr('p.usageTip', {
+      'in': pt, hit: hit, miss: miss, out: ct,
+      think: rs ? tr('p.usageThink', { n: rs }) : ''
+    });
+    m.$usage.style.display = '';
   }
 
   function bubble(m, idx) {
@@ -1557,8 +1764,8 @@
       var back = document.createElement('button');
       back.className = 'cp cp-back';
       back.type = 'button';
-      back.title = '丢掉这条和后面的，把这条放回输入框（不可撤销）';
-      back.textContent = '回到这里';
+      back.title = tr('p.backTitle');
+      back.textContent = tr('p.back');
       back.addEventListener('click', function (e) {
         e.preventDefault();
         e.stopPropagation();
@@ -1571,7 +1778,7 @@
       var think = document.createElement('details');
       think.className = 'think';
       var sum = document.createElement('summary');
-      sum.textContent = '思考过程';
+      sum.textContent = tr('p.think');
       var tt = document.createElement('div');
       tt.className = 'tt';
       think.appendChild(sum);
@@ -1588,8 +1795,8 @@
       var cp = document.createElement('button');
       cp.className = 'cp cp-msg';
       cp.type = 'button';
-      cp.title = '复制这条回答（纯文本，表格已对齐）';
-      cp.textContent = '复制';
+      cp.title = tr('p.copyAnswerTitle');
+      cp.textContent = tr('p.copy');
       cp.addEventListener('click', function (e) {
         e.preventDefault();
         e.stopPropagation();
@@ -1597,6 +1804,20 @@
         copyText(mdToText(splitReco(m.content || m.show || '').body), cp);
       });
       b.appendChild(cp);
+      // 「重试」：看完一段回答觉得不对味时最顺手的动作 —— 问题不动，让它重答一遍。
+      // 和「回到这里」是两件事：那个是**改问题**（文字放回输入框、消息删掉），
+      // 这个是**换个答案**（问题原样留着，只把这条回答替换掉）。
+      var rt = document.createElement('button');
+      rt.className = 'cp cp-msg cp-retry';
+      rt.type = 'button';
+      rt.title = tr('p.retryTitle');
+      rt.textContent = tr('p.retry');
+      rt.addEventListener('click', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        retryMsg(m);
+      });
+      b.appendChild(rt);
     }
     if (m.attachments && m.attachments.length) {
       var atts = document.createElement('div');
@@ -1619,6 +1840,23 @@
     b.appendChild(reco);
     m.$reco = reco;
     renderReco(m);
+    // 这一轮花了多少 token（见 syncUsage）—— 只有看得见，才谈得上"省"
+    if (m.role === 'assistant') {
+      var us = document.createElement('div');
+      us.className = 'usage';
+      b.appendChild(us);
+      m.$usage = us;
+      syncUsage(m);
+    }
+    // 这条是什么时候说的。老记录（2026-10-13 之前存的）没有 ts —— 那就不显示，
+    // 不拿"现在"去糊一个假时间。
+    if (typeof m.ts === 'number' && m.ts) {
+      var tm = document.createElement('div');
+      tm.className = 'time';
+      tm.textContent = fmtTime(m.ts);
+      tm.title = new Date(m.ts).toLocaleString();
+      b.appendChild(tm);
+    }
     row.appendChild(b);
     m.$body = body;
     return row;
@@ -1652,18 +1890,20 @@
   // 「推荐图片」那段标记会剥掉（它是给界面用的）。
   function chatsToMd(chats, nowMs) {
     var now = new Date(nowMs || Date.now());
-    var L = ['# Nova 对话记录', '',
-      '导出时间：' + ymd(now) + ' ' + hm(now) + '　·　共 ' + ((chats || []).length) + ' 个对话', ''];
+    var L = [tr('p.mdTitle', { name: A.name || 'Nova' }), '',
+      tr('p.mdTime', { t: ymd(now) + ' ' + hm(now), n: (chats || []).length }), ''];
     (chats || []).forEach(function (c) {
       var t = new Date(Number(c.updatedAt) || Date.now());
-      L.push('---', '', '## ' + (c.title || '新对话'), '',
-        '_最后更新 ' + ymd(t) + ' ' + hm(t) + '　·　' + ((c.messages || []).length) + ' 条_', '');
+      L.push('---', '', '## ' + titleText(c), '',
+        tr('p.mdLast', { t: ymd(t) + ' ' + hm(t), n: (c.messages || []).length }), '');
       (c.messages || []).forEach(function (m) {
-        L.push('**' + (m.role === 'user' ? (A.user || '我') : (A.name || 'Nova')) + '**', '');
-        L.push(splitReco(m.show || '').body || '（空）');
+        L.push('**' + (m.role === 'user' ? (A.user || tr('p.mdMe')) : (A.name || 'Nova')) + '**', '');
+        L.push(splitReco(m.show || '').body || tr('p.mdEmpty'));
         L.push('');
         if (m.attachments && m.attachments.length) {
-          L.push('> 附件：' + m.attachments.map(function (a) { return a.name; }).join('、'), '');
+          L.push(tr('p.mdAttach', {
+            list: m.attachments.map(function (a) { return a.name; }).join(tr('p.mdSep'))
+          }), '');
         }
       });
     });
@@ -1688,14 +1928,15 @@
 
   function exportAll() {
     var list = state.chats.filter(function (c) { return (c.messages || []).length; });
-    if (!list.length) { toast('还没有可导出的对话'); return; }
+    if (!list.length) { toast(tr('p.exportNone')); return; }
     var d = new Date();
-    var name = 'Nova对话-' + ymd(d).replace(/-/g, '') + '-' + two(d.getHours()) + two(d.getMinutes()) + '.md';
+    var stamp = ymd(d).replace(/-/g, '') + '-' + two(d.getHours()) + two(d.getMinutes());
+    var name = tr('p.fileName', { name: A.name || 'Nova', stamp: stamp }) + '.md';
     if (!downloadText(name, chatsToMd(list))) {
-      toast('导出失败了：这个页面可能不允许下载');
+      toast(tr('p.exportFail'));
       return;
     }
-    toast('已导出 ' + list.length + ' 个对话 —— 在浏览器的下载文件夹里：' + name);
+    toast(tr('p.exported', { n: list.length, file: name }));
   }
 
   // 清理：只动「超过 CLEAN_DAYS 天」的，且**不碰你正在看的那个**。删之前先问一次。
@@ -1712,8 +1953,8 @@
         if (c.id !== curId && t && (!oldest || t < oldest)) { oldest = t; }
       });
       toast(oldest
-        ? '没有超过 ' + CLEAN_DAYS + ' 天的对话（最早的是 ' + Math.max(1, Math.round((now - oldest) / 86400000)) + ' 天前）'
-        : '没有可清理的对话');
+        ? tr('p.cleanNone', { d: CLEAN_DAYS, e: Math.max(1, Math.round((now - oldest) / 86400000)) })
+        : tr('p.cleanNothing'));
       return;
     }
     var chars = 0;
@@ -1722,15 +1963,14 @@
         chars += String(m.content || '').length + String(m.show || '').length;
       });
     });
-    askConfirm('清理旧对话？',
-      '会删掉 ' + old.length + ' 个「超过 ' + CLEAN_DAYS + ' 天没动过」的对话（约 ' + Math.round(chars / 1000) + 'k 字）。' +
-      '删掉就找不回来了 —— 想留着就先点「导出 md」。你正在看的这个不会被删。',
-      '删掉 ' + old.length + ' 个',
+    askConfirm(tr('p.cleanQ'),
+      tr('p.cleanBody', { n: old.length, d: CLEAN_DAYS, k: Math.round(chars / 1000) }),
+      tr('p.cleanDo', { n: old.length }),
       function () {
         old.forEach(function (c) { dropChat(c); });
         persist();
         renderHistory();
-        toast('已清理 ' + old.length + ' 个旧对话');
+        toast(tr('p.cleaned', { n: old.length }));
       });
   }
 
@@ -1752,25 +1992,25 @@
     cfmAction = fn;
     el.cfmT.textContent = title;
     el.cfmM.textContent = msg;
-    el.cfmYes.textContent = yesLabel || '确定';
+    el.cfmYes.textContent = yesLabel || tr('p.ok');
     el.cfm.classList.add('show');
   }
 
   function askRollback(idx) {
     var c = state.cur;
     if (!c || !c.messages[idx]) { return; }
-    if (state.sending) { toast('正在回答，先按停止再回滚'); return; }
+    if (state.sending) { toast(tr('p.backBusy')); return; }
     var dropped = c.messages.length - idx;
     var chars = 0;
     for (var i = idx; i < c.messages.length; i++) { chars += String(c.messages[i].content || '').length; }
     var hadAtt = c.messages.slice(idx).some(function (x) { return x.attachments && x.attachments.length; });
     var hadInput = !!(el.input && el.input.value.trim());
-    askConfirm('回到这条之前？',
-      '会丢掉这条和后面共 ' + dropped + ' 条（约 ' + chars + ' 字）。' +
-      (hadAtt ? '其中带过附件/图片 —— 图片不会回来。' : '') +
-      (hadInput ? '输入框里现在的字也会被换掉。' : '') +
-      '这条的文字会放回输入框，改完可以直接发。',
-      '丢掉，重来',
+    askConfirm(tr('p.backQ'),
+      tr('p.backBody', { n: dropped, c: chars }) +
+      (hadAtt ? tr('p.backAtt') : '') +
+      (hadInput ? tr('p.backInput') : '') +
+      tr('p.backKeep'),
+      tr('p.discard'),
       function () { doRollback(idx); });
   }
 
@@ -1789,7 +2029,7 @@
     // 从另一个窗口那份里又救回来 —— 表现就是"回滚完，删掉的那几轮自己回来了"。
     c.cutAt = c.messages.length ? msgKey(c.messages[c.messages.length - 1]) : '';
     c.cutTs = Date.now();
-    if (!c.messages.length) { c.title = '新对话'; }
+    if (!c.messages.length) { c.title = NEW_TITLE; }
     el.input.value = back;
     autoGrow();
     persist();
@@ -1800,8 +2040,8 @@
       el.input.setSelectionRange(el.input.value.length, el.input.value.length);
     } catch (e) {}
     toast(back
-      ? '已回到这条之前（丢掉 ' + dropped + ' 条），改完可以直接发'
-      : '已回到这条之前（丢掉 ' + dropped + ' 条）· 这条带的是附件/网页，正文没回填');
+      ? tr('p.backDone', { n: dropped })
+      : tr('p.backDoneNoText', { n: dropped }));
   }
 
   function renderChips() {
@@ -1809,10 +2049,9 @@
     if (el.page) {
       var pm = state.pageMode;
       el.page.classList.toggle('on', !!pm);
-      el.page.textContent = pm === 'full' ? '整页' : (pm === 'view' ? '可见区' : '应用网页');
-      el.page.title = pm
-        ? '再点一下切换：整页 / 可见区 / 关闭'
-        : '让对话阅读当前网页。点一下开启"整页"，再点变成"只读可见区"';
+      el.page.textContent = pm === 'full' ? tr('p.pageFull')
+        : (pm === 'view' ? tr('p.pageVisible') : tr('p.page'));
+      el.page.title = pm ? tr('p.pageOnTitle') : tr('p.pageOffTitle');
     }
     var hasAny = state.atts.length || state.pageCtx || state.sel.length;
     if (!hasAny) { el.chips.style.display = 'none'; return; }
@@ -1823,13 +2062,13 @@
       pc.className = 'chip page';
       var pb = document.createElement('b');
       var pcN = state.pageCtx.images || 0;
-      var pcPrefix = state.pageCtx.mode === 'view' ? '可见区：' : '整页：';
-      pb.textContent = pcPrefix + state.pageCtx.title + (pcN ? ' · ' + pcN + ' 图' : '') +
-        (state.pageCtx.reused ? ' · 正文已缓存' : '');
+      var pcPrefix = state.pageCtx.mode === 'view' ? tr('p.chipView') : tr('p.chipFull');
+      pb.textContent = pcPrefix + state.pageCtx.title + (pcN ? tr('p.chipImgs', { n: pcN }) : '') +
+        (state.pageCtx.reused ? tr('p.chipCached') : '');
       pb.title = state.pageCtx.title;
       var px = document.createElement('button');
       px.textContent = '×';
-      px.title = '不再阅读本页';
+      px.title = tr('p.stopRead');
       px.addEventListener('click', function () { state.pageCtx = null; state.pageMode = null; renderChips(); });
       pc.appendChild(pb);
       pc.appendChild(px);
@@ -1842,11 +2081,11 @@
       var c = document.createElement('div');
       c.className = 'chip sel';
       var b = document.createElement('b');
-      b.textContent = (s.label || '选中文字') + ' · ' + (s.text || '').length + ' 字';
+      b.textContent = tr('p.selChip', { label: s.label || tr('p.selText'), n: (s.text || '').length });
       b.title = (s.prompt ? s.prompt + '\n\n' : '') + (s.text || '');
       var x = document.createElement('button');
       x.textContent = '×';
-      x.title = '撤掉这段';
+      x.title = tr('p.selUndo');
       x.addEventListener('click', function (e) {
         e.stopPropagation();
         state.sel.splice(i, 1);
@@ -1869,13 +2108,13 @@
         th.src = a.dataUrl;
         th.alt = '';
         c.appendChild(th);
-        c.title = '双击查看这张图';
+        c.title = tr('p.viewImg');
       }
       var b = document.createElement('b');
       b.textContent = a.name;
       var x = document.createElement('button');
       x.textContent = '×';
-      x.title = '移除';
+      x.title = tr('p.remove');
       x.addEventListener('click', function (e) {
         e.stopPropagation();
         state.atts.splice(i, 1);
@@ -1910,7 +2149,7 @@
     if (!el.viewer || !a || !a.dataUrl) { return; }
     el.vimg.src = a.dataUrl;
     var sz = fmtSize(a.size);
-    el.vcap.textContent = (a.name || '图片') + (sz ? ' · ' + sz : '') + '  ·  点这里或按 Esc 关掉';
+    el.vcap.textContent = (a.name || tr('p.thumb')) + (sz ? ' · ' + sz : '') + tr('p.viewerHint');
     el.viewer.classList.add('show');
   }
   function closeViewer() {
@@ -1921,34 +2160,49 @@
     el.vimg.removeAttribute('src');
   }
 
+  // 一条对话是否命中搜索词：标题 + 每条消息的**显示文本**（show）。
+  // 搜 show 不搜 content —— content 里塞着整页网页正文和附件全文，拿它来匹配
+  // 会出现"这对话我明明没提过这个词，怎么搜出来了"的诡异结果。
+  function chatHit(c, q) {
+    if (!q) { return true; }
+    if (String(c.title || '').toLowerCase().indexOf(q) >= 0) { return true; }
+    return (c.messages || []).some(function (m) {
+      return String((m && m.show) || '').toLowerCase().indexOf(q) >= 0;
+    });
+  }
+
   function renderHistory() {
     el.dlist.textContent = '';
-    if (!state.chats.length) {
+    var raw = el.dq ? el.dq.value.trim() : '';
+    var q = raw.toLowerCase();
+    var list = state.chats.slice();
+    if (q) { list = list.filter(function (c) { return chatHit(c, q); }); }
+    if (!list.length) {
       var p = document.createElement('div');
       p.className = 'empty';
       p.style.fontSize = '12.5px';
-      p.textContent = '还没有历史对话';
+      p.textContent = raw ? tr('p.noHit', { q: raw }) : tr('p.noHistory');
       el.dlist.appendChild(p);
       return;
     }
-    state.chats.slice().sort(function (a, b) { return b.updatedAt - a.updatedAt; }).forEach(function (c) {
+    list.sort(function (a, b) { return b.updatedAt - a.updatedAt; }).forEach(function (c) {
       var it = document.createElement('div');
       it.className = 'hitem' + (state.cur && c.id === state.cur.id ? ' on' : '');
       var t = document.createElement('div');
       t.className = 't';
-      t.textContent = c.title || '新对话';
+      t.textContent = titleText(c);
       var d = document.createElement('div');
       d.className = 'd';
       d.textContent = fmtTime(c.updatedAt);
       var x = document.createElement('button');
       x.className = 'x';
       x.textContent = '×';
-      x.title = '删除这条';
+      x.title = tr('p.delItem');
       x.addEventListener('click', function (e) {
         e.stopPropagation();
-        askConfirm('删除这个对话？',
-          '「' + (c.title || '新对话') + '」共 ' + (c.messages || []).length + ' 条，删掉就找不回来了。',
-          '删掉',
+        askConfirm(tr('p.delQ'),
+          tr('p.delBody', { t: titleText(c), n: (c.messages || []).length }),
+          tr('p.delDo'),
           function () {
             dropChat(c);
             if (state.cur === c) { state.cur = state.chats[0] || newChat(); if (state.chats.indexOf(state.cur) < 0) state.chats.unshift(state.cur); }
@@ -1961,6 +2215,10 @@
       it.addEventListener('click', function () {
         state.cur = c;
         state.atts = [];
+        state.histIdx = -1;        // 换对话了，↑ 翻历史的状态跟着归零
+        // 选完就把搜索词清掉：不清的话下次打开抽屉还是那个过滤结果，
+        // 看上去就像"我的对话全没了"。
+        if (el.dq) { el.dq.value = ''; }
         persist(); renderChips(); renderAll(); renderHistory();
         el.drawer.classList.remove('open');
       });
@@ -2050,7 +2308,7 @@
     if (!state.pageMode) {
       state.pageCtx = null;
       renderChips();
-      toast('已关闭阅读本页');
+      toast(tr('p.pageClosed'));
       return Promise.resolve();
     }
 
@@ -2064,60 +2322,78 @@
         state.pageMode = null;
         state.pageCtx = null;
         renderChips();
-        toast('这个页面读不了（' + ((g && g.error) || '') + '）');
+        toast(tr('p.pageCant', { why: (g && g.error) || '' }));
         return;
       }
 
       if (state.pageMode === 'full') {
         var text = g.text || '';
         state.pageCtx = {
-          title: g.title || '（无标题）', chars: text.length,
+          title: g.title || tr('p.untitled'), chars: text.length,
           images: (g.images || []).length, mode: 'full'
         };
         renderChips();
-        var msg = '读整页：' + text.length + ' 字';
-        if (state.pageCtx.images) { msg += '、' + state.pageCtx.images + ' 张图'; }
-        if (g.cut) { msg += '（正文超长已截断）'; }
-        if (state.pageCtx.images && !canSeeImages()) { msg += '；当前模型看不了图，图片会被跳过'; }
-        toast(msg + '，提问时会一起带上');
+        var msg = tr('p.pageFullToast', { n: text.length });
+        if (state.pageCtx.images) { msg += tr('p.pageImgPart', { n: state.pageCtx.images }); }
+        if (g.cut) { msg += tr('p.pageCut'); }
+        if (state.pageCtx.images && !canSeeImages()) { msg += tr('p.pageNoVisionSuffix'); }
+        toast(msg + tr('p.pageWillSend'));
         return;
       }
 
       var vt = g.visible || '';
       state.pageCtx = {
-        title: g.title || '（无标题）', chars: vt.length,
+        title: g.title || tr('p.untitled'), chars: vt.length,
         images: 1, mode: 'view'    // 截图是发送那一刻才拍的，这里先按"有一张"计数
       };
       renderChips();
-      toast('只读可见区：屏幕内 ' + vt.length + ' 字 + 一张截图（发送时才截）');
+      toast(tr('p.pageViewToast', { n: vt.length }));
     });
   }
 
-  // 只取当前视口内真正渲染出来的文字：按文本节点走，判断父元素的位置框
-  // 有没有和视口相交。display:none 的元素位置框是 0，自然被排除。
+  // 只取当前视口内真正渲染出来的文字。
+  //
+  // 写法是**元素剪枝**：从 body 起做先序遍历，但把"元素"当作剪枝单位 —— 元素的
+  // 位置框和视口不相交，整棵子树都不往里翻。老写法是按文本节点走、每个文本都拿
+  // 父元素去量一次位置框，一个 3 万节点的页面要调 2.6 万次 getBoundingClientRect，
+  // 实测约 44ms（点「引用当前网页」会顿一下）；换成剪枝后约 2000 次 / 3ms。
+  //
+  // 顺序仍是文档顺序：压栈时逆序压，弹出即先序 —— 同一个 <p> 里 "甲<b>乙</b>丙"
+  // 收出来还是 甲/乙/丙，不会变成 甲/丙/乙。
+  //
+  // 一处**有意的取舍**：position:fixed 的元素（吸顶导航、浮动客服、回到顶部）的
+  // 可见性不取决于祖先，所以祖先容器滚出视口时它会跟着被剪掉。这类元件上就几个字
+  // （"在线客服"这种），对"引用正文"没有价值 —— 要救它只能少剪枝，成本立刻吃回去
+  // （实测放行 body 的直接子元素只盖得住浅层的，真实的浮动元件往往嵌得很深）。
   function grabVisibleText() {
-    var out = [];
+    var out = [], seen = {};
     var vw = window.innerWidth, vh = window.innerHeight;
     var root = document.body || document.documentElement;
     if (!root) { return ''; }
-    var walker = null;
-    try { walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null); } catch (e) { return ''; }
-    var node, seen = {};
-    while ((node = walker.nextNode())) {
-      var t = String(node.nodeValue || '').replace(/\s+/g, ' ').trim();
-      if (t.length < 2) { continue; }
-      var p = node.parentElement;
-      if (!p) { continue; }
-      var tag = p.tagName;
+    var LIMIT = 600;
+    var stack = [], c;
+    // 从 root 的直接子节点起步（root 自己不判可见性，跟老写法一致）
+    for (c = root.lastChild; c; c = c.previousSibling) { stack.push(c); }
+    while (stack.length) {
+      var n = stack.pop();
+      if (n.nodeType === 3) {
+        // 能走到这个文本，说明它祖先链上每个元素都被判定可见了 —— 不用再量一次
+        var t = String(n.nodeValue || '').replace(/\s+/g, ' ').trim();
+        if (t.length < 2 || seen[t]) { continue; }
+        seen[t] = 1;
+        out.push(t);
+        if (out.length >= LIMIT) { break; }
+        continue;
+      }
+      if (n.nodeType !== 1) { continue; }
+      var tag = n.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEXTAREA') { continue; }
       var r;
-      try { r = p.getBoundingClientRect(); } catch (e) { continue; }
-      if (!r || (!r.width && !r.height)) { continue; }
+      try { r = n.getBoundingClientRect(); } catch (e) { continue; }
+      if (!r || (!r.width && !r.height)) { continue; }   // display:none 这类：位置框是 0
+      // 视口外 → 整块不翻（这就是快的地方）
       if (r.bottom < 0 || r.top > vh || r.right < 0 || r.left > vw) { continue; }
-      if (seen[t]) { continue; }
-      seen[t] = 1;
-      out.push(t);
-      if (out.length >= 600) { break; }
+      for (c = n.lastChild; c; c = c.previousSibling) { stack.push(c); }
     }
     return out.join('\n');
   }
@@ -2171,12 +2447,12 @@
       });
     }
     return new Promise(function (res) {
-      function fail(msg) { res({ ok: false, error: msg || '这个页面读不了' }); }
+      function fail(msg) { res({ ok: false, error: msg || tr('p.pageCantShort') }); }
       try {
-        if (!chrome.tabs || !chrome.tabs.query) { fail('这里拿不到标签页'); return; }
+        if (!chrome.tabs || !chrome.tabs.query) { fail(tr('p.noTabs')); return; }
         chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
           var tab = tabs && tabs[0];
-          if (chrome.runtime.lastError || !tab || typeof tab.id !== 'number') { fail('找不到当前标签页'); return; }
+          if (chrome.runtime.lastError || !tab || typeof tab.id !== 'number') { fail(tr('p.noActiveTab')); return; }
           chrome.tabs.sendMessage(tab.id, { type: 'ds-grab-page' }, function (r) {
             var err = chrome.runtime.lastError;
             if (err || !r || !r.ok) { fail((err && err.message) || (r && r.error)); return; }
@@ -2231,12 +2507,12 @@
       if (isImg) {
         // 图片：选进来先压到 1536 长边以内，再交给能看图的模型
         if (f.size > MAX_IMG_FILE) {
-          toast('「' + f.name + '」太大了（原图上限 40MB）');
+          toast(tr('p.attTooBig', { name: f.name }));
           if (--left === 0) { renderChips(); }
           return;
         }
         if (!canSeeImages()) {
-          toast('当前模型（' + state.model + '）看不了图，可切到 V4.1 Flash');
+          toast(tr('p.attNoVision', { m: state.model }));
         }
         var fr = new FileReader();
         state.reading++;
@@ -2250,19 +2526,19 @@
         };
         fr.onerror = function () {
           state.reading--;
-          toast('「' + f.name + '」读取失败');
+          toast(tr('p.attReadFail', { name: f.name }));
           if (--left === 0) { renderChips(); }
         };
         fr.readAsDataURL(f);
         return;
       }
       if (f.size > MAX_FILE) {
-        toast('「' + f.name + '」太大（文本上限 512KB）');
+        toast(tr('p.attTextTooBig', { name: f.name }));
         if (--left === 0) { renderChips(); }
         return;
       }
       if (f.type && f.type.indexOf('text/') !== 0 && !TEXT_EXT.test(f.name)) {
-        toast('「' + f.name + '」不是文本也不是图片，跳过');
+        toast(tr('p.attSkip', { name: f.name }));
         if (--left === 0) { renderChips(); }
         return;
       }
@@ -2271,11 +2547,11 @@
         var txt = String(r.result);
         var cut = txt.length > MAX_TEXT_SENT;
         state.atts.push({ name: f.name, size: f.size, text: cut ? txt.slice(0, MAX_TEXT_SENT) : txt });
-        if (cut) { toast('「' + f.name + '」内容太长，只取前 ' + MAX_TEXT_SENT + ' 字符'); }
+        if (cut) { toast(tr('p.attCut', { name: f.name, n: MAX_TEXT_SENT })); }
         if (--left === 0) { renderChips(); }
       };
       r.onerror = function () {
-        toast('「' + f.name + '」读取失败');
+        toast(tr('p.attReadFail', { name: f.name }));
         if (--left === 0) { renderChips(); }
       };
       r.readAsText(f);
@@ -2306,7 +2582,7 @@
         var ext = String(blob.type || '').split('/')[1] || 'png';
         ext = ext.replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '');
         try {
-          out.push(new File([blob], '粘贴的图片.' + ext, { type: blob.type }));
+          out.push(new File([blob], tr('p.pastedImg') + '.' + ext, { type: blob.type }));
         } catch (e) {
           out.push(blob);   // 没有 File 构造器就直接用 Blob（名字会显示成"未命名"）
         }
@@ -2324,8 +2600,7 @@
     e.preventDefault();
     e.stopPropagation();
     addFiles(files);
-    toast(files.length > 1 ? ('已粘贴 ' + files.length + ' 个文件，放进附件')
-                           : '已粘贴，放进附件');
+    toast(files.length > 1 ? tr('p.pastedMany', { n: files.length }) : tr('p.pastedOne'));
   }
 
   // ---------------- 拖到球上 ----------------
@@ -2334,7 +2609,7 @@
       var p = String(abs).split('?')[0].split('#')[0].split('/').pop();
       if (p && p.length < 40 && /\.(png|jpe?g|gif|webp|avif)$/i.test(p)) { return p; }
     } catch (e) {}
-    return '拖入的图片';
+    return tr('p.dropImg');
   }
 
   function pushImage(name, dataUrl) {
@@ -2348,7 +2623,7 @@
   function addImageUrl(url) {
     var abs;
     try { abs = new URL(url, location.href).href; } catch (e) { return false; }
-    if (/^data:image\//i.test(abs)) { pushImage('拖入的图片', abs); return true; }
+    if (/^data:image\//i.test(abs)) { pushImage(tr('p.dropImg'), abs); return true; }
     if (!/^https?:/i.test(abs)) { return false; }
 
     var name = nameFromUrl(abs);
@@ -2357,11 +2632,11 @@
       if (!r.ok) { throw new Error('HTTP ' + r.status); }
       return r.blob();
     }).then(function (blob) {
-      if (blob.size > MAX_IMG_FILE) { throw new Error('图片太大'); }
+      if (blob.size > MAX_IMG_FILE) { throw new Error(tr('p.imgTooBig')); }
       return new Promise(function (res, rej) {
         var fr = new FileReader();
         fr.onload = function () { res(String(fr.result)); };
-        fr.onerror = function () { rej(new Error('读取失败')); };
+        fr.onerror = function () { rej(new Error(tr('p.readFail'))); };
         fr.readAsDataURL(blob);
       });
     }).then(function (dataUrl) {
@@ -2371,7 +2646,7 @@
       });
     }).catch(function () {
       state.reading--;
-      pushImage(name + '（链接）', abs);
+      pushImage(name + tr('p.asLink'), abs);
     });
     return true;
   }
@@ -2418,7 +2693,7 @@
 
     if (files.length) {
       addFiles(files);
-      toast('拖进来 ' + files.length + ' 个文件，已放进附件');
+      toast(tr('p.droppedMany', { n: files.length }));
       return;
     }
 
@@ -2432,7 +2707,7 @@
       if (/\.(png|jpe?g|gif|webp|avif)(\?|#|$)/i.test(first)) { img = first; }
     }
     if (img && addImageUrl(img)) {
-      toast('拖进来的图片已放进附件');
+      toast(tr('p.droppedImg'));
       return;
     }
 
@@ -2442,10 +2717,10 @@
       el.input.value = cur ? (cur + '\n' + t) : t;
       autoGrow();
       try { el.input.focus(); } catch (e) {}
-      toast('拖进来的文字已放进输入框，直接问就行');
+      toast(tr('p.droppedText'));
       return;
     }
-    toast('没识别到文字或文件');
+    toast(tr('p.dropNone'));
   }
 
   // ---------------- 请求 ----------------
@@ -2458,7 +2733,7 @@
   function setSend(sending) {
     state.sending = sending;
     el.send.innerHTML = sending ? ICONS.stop : ICONS.send;
-    el.send.title = sending ? '停止' : '发送';
+    el.send.title = sending ? tr('p.stop') : tr('p.send');
   }
 
   // ---------------- 网页正文的增量缓存 ----------------
@@ -2475,6 +2750,26 @@
     while (i) { h = ((h * 33) ^ str.charCodeAt(--i)) >>> 0; }
     return h.toString(16) + ':' + str.length;
   }
+  // 附件正文的指纹：名字 + 长度 + 内容哈希。
+  // 名字和长度挡掉"同名但不是同一个文件"，哈希挡掉"改了内容却长度一样"。
+  function attSig(atts) {
+    return atts.map(function (a) {
+      var t = String(a.text || '');
+      return (a.name || '') + ':' + t.length + ':' + hashText(t);
+    }).join('\u0000');
+  }
+  // 窗口里已经出现过同一份附件正文吗？和 pageBlockInWindow 一个道理：
+  // 只有那条消息落在最近 KEEP_RECENT 条之内，才能**证明**"这次请求里确实带着那份正文"
+  // （那几条是无条件保留的）。证明不了就老实重发 —— 宁可多花 token，也不能让模型手里没有正文。
+  function attInWindow(sig) {
+    var msgs = (state.cur && state.cur.messages) || [];
+    for (var n = 0, i = msgs.length - 1; i >= 0 && n < KEEP_RECENT; i--, n++) {
+      var ak = msgs[i].attKey;
+      if (ak && ak.sig === sig) { return true; }
+    }
+    return false;
+  }
+
   function pageBlockInWindow(url, hash) {
     var msgs = (state.cur && state.cur.messages) || [];
     for (var n = 0, i = msgs.length - 1; i >= 0 && n < KEEP_RECENT; i--, n++) {
@@ -2483,6 +2778,37 @@
     }
     return false;
   }
+
+  // >>> ctxWindow —— 离线单测（docs/test-render.js）从这两行标记之间把这段抠出去跑，别动标记
+  // 决定这次请求**实际带哪几条**历史。纯函数：没有外部依赖，全走参数，所以能离线测。
+  //
+  // 唯一要保证的事：**前缀要稳**（道理见 CTX_CHUNK）。
+  //   · 没超预算 → 一条都不动，前缀和上一轮完全一致；
+  //   · 超了 → 从后往前塞到预算用完，得到起始下标 k，再把 k **往上**取到 chunk 的整数倍。
+  //     取整朝"多丢"那一侧，所以留下来的必然还在预算之内。
+  // keepRecent 是硬下限：最近这几条无条件保留，哪怕预算已经负数 ——
+  // 否则连"你刚才说的那个"都答不了。取整也不许吃掉这个下限（cap）。
+  function ctxWindow(msgs, budget, keepRecent, chunk) {
+    var total = 0, i, len;
+    for (i = 0; i < msgs.length; i++) {
+      total += (msgs[i] && typeof msgs[i].content === 'string') ? msgs[i].content.length : 0;
+    }
+    if (total <= budget) { return { kept: msgs.slice(), total: total, from: 0 }; }
+    var acc = 0, k = msgs.length, must;
+    for (i = msgs.length - 1; i >= 0; i--) {
+      len = (msgs[i] && typeof msgs[i].content === 'string') ? msgs[i].content.length : 0;
+      must = (msgs.length - i) <= keepRecent;
+      if (!must && acc + len > budget) { break; }
+      acc += len;
+      k = i;
+    }
+    // 档位量化 + 不许越过"最近 keepRecent 条"这条线
+    var cap = Math.max(0, msgs.length - keepRecent);
+    if (chunk > 1) { k = Math.ceil(k / chunk) * chunk; }
+    k = Math.min(k, cap);
+    return { kept: msgs.slice(k), total: total, from: k };
+  }
+  // <<< ctxWindow
 
   function buildMessages() {
     var out = [];
@@ -2496,17 +2822,8 @@
     var msgs = state.cur.messages.filter(function (m) {
       return !(m.role === 'assistant' && !m.content);
     });
-    // 从最近往回数，塞到预算用完为止；再保证至少留 KEEP_RECENT 条。
-    // 早于这个窗口的历史不带过去 —— 模型会"忘了"更早的内容，但总比整段发过去直接报错强。
-    var kept = [], budget = MAX_CTX_CHARS, i, m, len, must;
-    for (i = msgs.length - 1; i >= 0; i--) {
-      m = msgs[i];
-      len = typeof m.content === 'string' ? m.content.length : 0;
-      must = (msgs.length - i) <= KEEP_RECENT;      // 最近这几条无条件保留
-      if (!must && budget - len < 0) { break; }
-      budget -= len;
-      kept.unshift(m);
-    }
+    // 该带哪几条交给 ctxWindow（纯函数，含档位量化；单测见 docs/test-render.js）
+    var kept = ctxWindow(msgs, MAX_CTX_CHARS, KEEP_RECENT, CTX_CHUNK).kept;
     state.ctxOmitted = msgs.length - kept.length;    // 面板上要用它提示用户
     state.ctxKept = kept.length;
     // 带图的那几条（apiContent 是多模态数组，只在内存里活着）只保留**最近 MAX_CTX_IMAGES 条**，
@@ -2540,23 +2857,34 @@
       Object.keys(cfg.headers).forEach(function (k) { headers[k] = cfg.headers[k]; });
     }
     state.ac = new AbortController();
+    // stream_options.include_usage：流式下 usage 只在**最后一块**里给，而且要显式要。
+    // 拿到它才知道这一轮花了多少 token、缓存命中多少 —— 不知道花了多少就谈不上省。
+    var payload = withEffort({
+      model: state.model,
+      messages: messages,
+      stream: true,
+      stream_options: { include_usage: true }
+    });
     var res = await fetch(base + path, {
       method: 'POST',
       signal: state.ac.signal,
       headers: headers,
-      body: JSON.stringify(withEffort({ model: state.model, messages: messages, stream: true }))
+      body: JSON.stringify(payload)
     });
     if (!res.ok) {
       var t = '';
       try { t = await res.text(); } catch (e) {}
-      var hint = '';
-      if (res.status === 401) { hint = '（API Key 不对：点右上角 ⚙ 去设置页换一把）'; }
-      else if (res.status === 402) { hint = '（余额不足）'; }
-      else if (res.status === 429) { hint = '（请求太频繁，等一下再试）'; }
-      throw new Error('HTTP ' + res.status + ' ' + hint + ' ' + t.slice(0, 200));
+      // 这里**不再拼提示文案**了 —— 文案统一归 friendlyErr 管：它还得处理网络层错误、
+      // AbortError、5xx 这些在 fetch 之后才看得见的情况，散在两处会互相打架。
+      // 这一步只负责把状态码原样带出去。
+      var err = new Error('HTTP ' + res.status + ' ' + t.slice(0, 300));
+      err.status = res.status;
+      err.body = t.slice(0, 300);
+      throw err;
     }
     if (!res.body || !res.body.getReader) {
       var j = await res.json();
+      if (j.usage) { onDelta({ usage: j.usage }); }
       onDelta({ content: j.choices && j.choices[0] && j.choices[0].message ? j.choices[0].message.content : '' });
       return;
     }
@@ -2576,6 +2904,8 @@
         if (!data || data === '[DONE]') { continue; }
         try {
           var jj = JSON.parse(data);
+          // 开了 include_usage 之后，最后一包**只带 usage、choices 是空数组** —— 先收 usage
+          if (jj.usage) { onDelta({ usage: jj.usage }); }
           var d = jj.choices && jj.choices[0] && jj.choices[0].delta;
           if (d) { onDelta(d); }
         } catch (e) { /* 半包，等下一块 */ }
@@ -2586,13 +2916,13 @@
   async function send() {
     if (state.sending) { return; }
     if (!ctxAlive()) {
-      toast('扩展刚被重新加载过，这个页面按一次 F5 就能继续用');
+      toast(tr('p.reloaded'));
       return;
     }
     var text = el.input.value.trim();
     if (!text && !state.atts.length && !state.sel.length && !state.pageMode) { return; }
     if (state.reading > 0) {
-      toast('图片还在读取，稍等一下再发');
+      toast(tr('p.imgReading'));
       return;
     }
     // Key 从浏览器里（设置页）读，不写在代码里。每次发送前重读一遍很小，但换来的是：
@@ -2600,7 +2930,7 @@
     var kc = await loadKey();
     syncKeyHint();
     if (cfg.requireKey !== false && !kc.key) {
-      toast('还没配 API Key：点右上角那个 ⚙ 填一下（也可以从扩展详情页进「扩展选项」）');
+      toast(tr('p.needKeyLong'));
       return;
     }
     if (!state.cur) {
@@ -2616,10 +2946,26 @@
       var blk = (s.prompt ? s.prompt + '\n\n' : '') + '```\n' + (s.text || '') + '\n```';
       full += (full ? '\n\n' : '') + blk;
     });
-    atts.forEach(function (a) {
-      if (a.image) { return; }   // 图片走 content 数组，不塞进文本
-      full += (full ? '\n\n' : '') + '【附件 ' + a.name + '】\n```\n' + a.text + '\n```';
-    });
+    // 文本附件。**做增量去重**（2026-10-13 补）—— 原来这里没有，是白花钱的大头：
+    // 一个附件最多能带 20 万字符（MAX_TEXT_SENT），拖一份长文档追问 5 轮，
+    // 那 20 万字就原样发 5 遍。网页正文早就有这套去重了，附件比它还贵，反而没有。
+    // 命中条件跟 pageBlockInWindow 完全一致：同一份内容在最近 KEEP_RECENT 条里出现过。
+    var attTexts = atts.filter(function (a) { return !a.image && a.text; });
+    var attKey = null, attReused = 0;
+    if (attTexts.length) {
+      var aSig = attSig(attTexts);
+      if (attInWindow(aSig)) {
+        attReused = attTexts.reduce(function (n, a) { return n + a.text.length; }, 0);
+        full += (full ? '\n\n' : '') + '【附件】' +
+          attTexts.map(function (a) { return a.name; }).join('、') +
+          '\n（内容和上面那条**完全相同**，不再重复发一遍 —— 接着看那份就行。）';
+      } else {
+        attTexts.forEach(function (a) {
+          full += (full ? '\n\n' : '') + '【附件 ' + a.name + '】\n```\n' + a.text + '\n```';
+        });
+      }
+      attKey = { sig: aSig };
+    }
 
     // 图片：本地图片附件 + 页面上的图
     var images = atts.filter(function (a) { return a.image && a.dataUrl; })
@@ -2635,7 +2981,7 @@
     if (state.pageMode) {
       g = await grabContext();
       if (!g.ok) {
-        toast('这个页面读不了（' + (g.error || '') + '）');
+        toast(tr('p.pageCant', { why: g.error || '' }));
         state.pageMode = null;
         renderChips();
       }
@@ -2659,7 +3005,7 @@
       if (!fReuse) { fImgs.forEach(function (u) { images.push(u); }); }
       pageKey = { url: fUrl, hash: fHash };
       state.pageCtx = {
-        title: fTitle || '（无标题）',
+        title: fTitle || tr('p.untitled'),
         chars: fText.length,
         images: fReuse ? 0 : fImgs.length,
         mode: 'full',
@@ -2677,7 +3023,7 @@
       if (needHide) { await sleep(180); }
       shot = await captureVisible(g.windowId);
       if (needHide && host) { host.style.setProperty('display', 'block', 'important'); }
-      if (!shot) { toast('截图没成功（这个页面可能不允许截，或一秒内截了两次）'); }
+      if (!shot) { toast(tr('p.shotFail')); }
       if (vReuse) {
         // 屏幕上那点文字和上一条一样 → 只发一行提示；**但截图照拍照发**（截图每轮都是新的，
         // 正是"可见区"模式的意义所在，省不得）。
@@ -2692,7 +3038,7 @@
       pageKey = { url: vUrl, hash: vHash };
       if (shot) { images.push(shot); }
       state.pageCtx = {
-        title: vTitle || '（无标题）',
+        title: vTitle || tr('p.untitled'),
         chars: vText.length,
         images: shot ? 1 : 0,
         mode: 'view',
@@ -2700,8 +3046,14 @@
       };
       renderChips();
     }
-    // 正文被复用（没重发）时给一句反馈：不然用户不知道"省了多少"，会以为没生效
-    if (pageReused) { toast('网页正文没变，这轮不重复发送（省下约 ' + pageReused + ' 字）'); }
+    // 正文被复用（没重发）时给一句反馈：不然用户不知道"省了多少"，会以为没生效。
+    // 附件和网页可能同时命中，合成一句说，别连着弹两条。
+    if (pageReused || attReused) {
+      var reusedWho = [];
+      if (attReused) { reusedWho.push(tr('p.reuseAtt')); }
+      if (pageReused) { reusedWho.push(tr('p.reusePage')); }
+      toast(tr('p.reuseToast', { who: reusedWho.join(tr('p.mdSep')), n: pageReused + attReused }));
+    }
 
     // 去重 + 限总量
     var seen = {};
@@ -2719,7 +3071,7 @@
           return (i + 1) + '. ' + show;
         }).join('\n');
       images = [];
-      toast('当前模型看不了图，这轮只发送了图片地址');
+      toast(tr('p.noVisionToast'));
     }
 
     // 有图就按官方的多模态格式发：content 用数组
@@ -2734,40 +3086,53 @@
     var um = {
       mid: uid(),                 // 消息身份：两个窗口合并时靠它认"是不是同一条"
       role: 'user',
+      ts: Date.now(),             // 这条是什么时候说的（气泡底部那行时间）
       // 这轮正文的指纹：下一轮如果还是同一页同一份内容，就不必重发（见 pageBlockInWindow）。
       // 不落库（plainChats 只挑固定字段），所以重开浏览器后一定会重发一次全文 —— 宁可多发，别丢上下文。
       pageKey: pageKey,
+      // 附件的指纹，同理（见 attInWindow）。同样**不落库**：附件里的图只活在内存里
+      // （apiContent），重开浏览器后老图回不来，那时候必须老老实实重发。
+      attKey: attKey,
       show: text || (state.sel.length ? state.sel[0].text.slice(0, 200)
-        : (pageSnap && pageSnap.text ? '（见下面的本页正文）' : '（见附件）')),
-      content: full || '（空消息）',
+        : (pageSnap && pageSnap.text ? tr('p.seePage') : tr('p.seeAtt'))),
+      content: full || tr('p.emptyMsg'),
       apiContent: apiContent,   // 只存在内存里，不落库（图片 base64 存进 storage 会撑爆配额）
       attachments: atts.map(function (a) { return { name: a.name, size: a.size }; })
         .concat(state.sel.map(function (s) {
-          return { name: (s.label || '选中文字') + ' · ' + (s.text || '').length + ' 字' };
+          return { name: tr('p.selChip', { label: s.label || tr('p.selText'), n: (s.text || '').length }) };
         }))
         .concat(state.pageCtx ? [{
-          name: (state.pageCtx.mode === 'view' ? '可见区：' : '整页：') + (state.pageCtx.title || '无标题')
+          name: (state.pageCtx.mode === 'view' ? tr('p.chipView') : tr('p.chipFull')) +
+            (state.pageCtx.title || tr('p.untitled'))
         }] : [])
     };
     state.cur.messages.push(um);
     el.input.value = '';
+    state.histIdx = -1;           // 发出去了，翻历史的状态归零（下一次 ↑ 从最新那条开始）
+    state.histDraft = '';
     autoGrow();
     state.atts = [];
     state.sel = [];
     renderChips();
-    if (state.cur.title === '新对话') {
+    if (state.cur.title === NEW_TITLE) {
       state.cur.title = (text || (atts[0] && atts[0].name) ||
-        (state.pageCtx && state.pageCtx.title) || '新对话').slice(0, 24);
+        (state.pageCtx && state.pageCtx.title) || NEW_TITLE).slice(0, 24);
     }
     if (el.list.querySelector('.empty')) { el.list.textContent = ''; }
     el.list.appendChild(bubble(um, state.cur.messages.length - 1));
     scrollBottom();
 
-    var am = { mid: uid(), role: 'assistant', show: '', content: '' };
+    var am = { mid: uid(), role: 'assistant', ts: Date.now(), show: '', content: '' };
     state.cur.messages.push(am);
-    var row = bubble(am);
-    el.list.appendChild(row);
+    el.list.appendChild(bubble(am));
     scrollBottom();
+    await runAnswer(am);
+  }
+
+  // 空 assistant 气泡已经挂上去之后，真正发请求 + 流式写进去的那一段。
+  // send()（新问一句）和 retryMsg()（换个答案）共用它 —— 两边唯一的差别是"上文是从哪来的"，
+  // 所以下面这些（建请求、吐字重绘、收尾、同步）一行都不用重复写两遍。
+  async function runAnswer(am) {
     setSend(true);
     persist();
     renderHistory();
@@ -2787,11 +3152,15 @@
     // 不然用户会觉得"它怎么把我刚说的话忘了"，其实是故意的。
     var sent = buildMessages();
     if (state.ctxOmitted > 0) {
-      toast('这段聊得有点长：只带了最近 ' + state.ctxKept + ' 条，前面 ' + state.ctxOmitted + ' 条这次省略了');
+      toast(tr('p.ctxTrim', { k: state.ctxKept, n: state.ctxOmitted }));
     }
 
+    var failed = null;
     try {
       await callAPI(sent, function (d) {
+        // 这一轮的实际用量（请求里开了 stream_options.include_usage 才有）：最后一包带回来。
+        // 当场画出来 —— 省不省钱全看这几个数，尤其「思考」那一项（档位选"不思考"时它该是 0）。
+        if (d.usage) { am.usage = d.usage; syncUsage(am); }
         if (d.reasoning_content) {
           am.reasoning = (am.reasoning || '') + d.reasoning_content;
         }
@@ -2805,14 +3174,18 @@
         if (Date.now() - lastSync > 1200) { lastSync = Date.now(); saveChatsMerged(); }
       });
     } catch (e) {
-      var msg = e && e.name === 'AbortError' ? '（已停止）' : ('出错了：' + (e && e.message ? e.message : e));
+      failed = e;
+      var msg = friendlyErr(e);
       am.show += (am.show ? '\n\n' : '') + '> ' + msg;
       am.content += ' ' + msg;
     }
 
     if (!am.show.trim()) {
-      am.show = '（没有返回内容）';
+      // 流式跑完了却一个字都没有：多半是模型只吐了思考、正文被截断。
+      // 标成 failed 才会在下面提示"可以重试" —— 干瞪眼是最没用的状态。
+      am.show = tr('p.noContent');
       am.content = am.show;
+      if (!failed) { failed = new Error('empty'); }
     }
     am.$body.innerHTML = mdToHtml(splitReco(am.show).body);
     renderReco(am);
@@ -2824,6 +3197,82 @@
     renderHistory();
     // 吐字期间收到过别的窗口的写入（当时不敢动正文，怕冲掉这半个气泡）→ 现在补一次对齐
     if (state.syncPending) { state.syncPending = false; syncNow(); }
+    // 失败时再提一句：原因虽然写在气泡里了，但用户可能正滚在别处，看不到
+    if (failed && failed.name !== 'AbortError') {
+      toast(tr('p.turnFail'));
+    }
+  }
+
+  // ---------------- 重试 ----------------
+  // 「重试」= 把这条 assistant 回答连同它**后面**的内容一起丢掉，用同样的上文再生成一遍。
+  // 和「回到这里」的分工：那个是改**问题**（文字放回输入框、消息删掉），
+  // 这个是换**答案**（问题原样留着，只重生成这一条）。
+  function retryMsg(m) {
+    if (!ctxAlive()) {
+      toast(tr('p.reloaded'));
+      return;
+    }
+    var c = state.cur;
+    var idx = c ? c.messages.indexOf(m) : -1;
+    if (idx < 0 || m.role !== 'assistant') { return; }
+    if (state.sending) { toast(tr('p.retryBusy')); return; }
+    var extra = c.messages.length - idx - 1;      // 这条之后还有几条
+    if (extra > 0) {
+      // 会丢东西就得问一声 —— 和"回到这里"同一把尺子：不可逆的动作不静默执行
+      askConfirm(tr('p.retryQ'),
+        tr('p.retryBody', { n: extra }),
+        tr('p.retryDo'), function () { doRetry(idx); });
+      return;
+    }
+    doRetry(idx);
+  }
+
+  async function doRetry(idx) {
+    var c = state.cur;
+    if (!c || state.sending) { return; }
+    // Key 每次重读（和 send 一样）：在另一个标签页里改完设置，这边立刻就用上
+    var kc = await loadKey();
+    syncKeyHint();
+    if (cfg.requireKey !== false && !kc.key) {
+      toast(tr('p.needKeyLong'));
+      return;
+    }
+    c.messages.length = idx;                      // 截断 —— 和「回到这里」同一套路，append-only
+    // 记一笔"后面那些是我故意删的"，不然写盘合并会把它们从另一个窗口那份里救回来
+    c.cutAt = c.messages.length ? msgKey(c.messages[c.messages.length - 1]) : '';
+    c.cutTs = Date.now();
+    // DOM 也跟着截：把第 idx 行起的所有气泡删掉。比整个 renderAll() 便宜得多
+    // （renderAll 会把前面每一条都重跑一遍 markdown，长对话里那是几十毫秒的顿挫）。
+    while (el.list.children.length > idx) { el.list.removeChild(el.list.lastChild); }
+    if (!el.list.children.length) { renderEmpty(); }
+    var am = { mid: uid(), role: 'assistant', ts: Date.now(), show: '', content: '' };
+    c.messages.push(am);
+    el.list.appendChild(bubble(am));
+    scrollBottom();
+    await runAnswer(am);
+  }
+
+  // ---------------- 把接口错误翻译成"人话 + 下一步做什么" ----------------
+  // 原来是把 e.message 原样贴出来，于是用户看到的是「Failed to fetch」「HTTP 401」这种 ——
+  // 唯一的信息是"坏了"，不知道该点哪儿。下面每一条都是我们真踩过的坑，所以写的是**动作**。
+  // 末尾一律保留原始报错：翻译错了的时候，原文是唯一的线索。
+  function friendlyErr(e) {
+    if (e && e.name === 'AbortError') { return tr('p.errStopped'); }
+    var s = String((e && e.message) || e || '');
+    var code = (e && e.status) || 0;
+    if (!code) {
+      var mm = s.match(/HTTP (\d{3})/);
+      if (mm) { code = Number(mm[1]); }
+    }
+    if (code === 401) { return tr('p.err401'); }
+    if (code === 402) { return tr('p.err402'); }
+    if (code === 429) { return tr('p.err429'); }
+    if (code === 400) { return tr('p.err400', { e: s }); }
+    if (code >= 500) { return tr('p.err5xx', { code: code }); }
+    if (code) { return tr('p.errHttp', { code: code, e: s }); }
+    // 没有状态码 = 请求根本没到服务器。本机上最常见的原因就是代理。
+    if (/Failed to fetch|NetworkError|Load failed|ERR_|net::/i.test(s)) { return tr('p.errNet'); }
+    return tr('p.errGeneric', { e: s });
   }
 
   // ---------------- 开合 ----------------
@@ -2889,7 +3338,7 @@
   function setFsBtnIcons() {
     if (!el.fsBtn) { return; }
     el.fsBtn.innerHTML = state.fs ? ICONS.shrink : ICONS.expand;
-    el.fsBtn.title = state.fs ? '退出全屏' : '全屏';
+    el.fsBtn.title = state.fs ? tr('p.unfull') : tr('p.full');
   }
 
   function toggleFs() {
@@ -3024,6 +3473,59 @@
     renderHistory();
   }
 
+  // ---------------- 界面语言：读取与热切换 ----------------
+  // 面板的 DOM 是一次性 innerHTML 建出来的（build()），所以换语言最省事的做法就是**整块重建**：
+  // 逐条改 textContent 得记住上百个节点，漏一个就是中英混着 —— 那比不切还难看。
+  // 重建前把用户当下的状态（输入框里的字、抽屉开没开、搜索词、滚动位置）记下来，建完放回去。
+  //
+  // 两个触发点：① 脚本加载时读一次；② 在设置页切了语言（storage 变化广播过来）。
+  function applyLang(v) {
+    var want = (v === 'en') ? 'en' : 'zh';
+    if (want === LANG) { return; }
+    LANG = want;
+    syncImgPromptText();
+    relang();
+  }
+
+  function relang() {
+    // 正在吐字时不动：这会儿重建会把 $body / $think 这些引用换成新的，
+    // 流式写入还在往**已经离场**的旧节点上写。等这一轮结束、下次打开自然是新语言。
+    if (!host || state.sending) { return; }
+    var wasOpen = isOpen();
+    var keep = {
+      input: el.input ? el.input.value : '',
+      drawer: !!(el.drawer && el.drawer.classList.contains('open')),
+      dq: el.dq ? el.dq.value : '',
+      scroll: el.list ? el.list.scrollTop : 0,
+      fs: !!state.fs
+    };
+    try { host.remove(); } catch (e) {}
+    host = null; root = null; el = {};
+    build();
+    if (el.input) { el.input.value = keep.input; autoGrow(); }
+    if (keep.dq && el.dq) { el.dq.value = keep.dq; }
+    renderChips();
+    renderAll();
+    renderHistory();
+    if (wasOpen) {
+      open(state.compact);
+      if (keep.drawer) { el.drawer.classList.add('open'); }
+      if (keep.fs) { state.fs = true; el.wrap.classList.add('fs'); applyFs(); setFsBtnIcons(); }
+      if (el.list) { el.list.scrollTop = keep.scroll; }
+    }
+  }
+
+  // 启动时读一次。异步，但用户双击球之前早就读完了；读不到就保持中文。
+  function initLang() {
+    try {
+      if (!chrome.storage || !chrome.storage.local) { return; }
+      chrome.storage.local.get(K_LANG, function (o) {
+        var v = o && o[K_LANG];
+        if (v === 'zh' || v === 'en') { applyLang(v); }
+      });
+    } catch (e) { /* 老环境：保持中文 */ }
+  }
+
   function open(compact) {
     build();
     closeViewer();                          // 上次如果开着预览/确认层，重新打开时不该还盖在上面
@@ -3088,14 +3590,14 @@
     if (!t) { return; }
     if (t.length > 8000) {
       t = t.slice(0, 8000);
-      toast('选中的文字太长，只取了前面 8000 字');
+      toast(tr('p.selTooLong'));
     }
-    var label = String(o.label || '选中文字');
+    var label = String(o.label || tr('p.selText'));
     var prompt = String(o.prompt || '');
     // 同一段文字 + 同一个动作点两次 → 不重复挂（不然手快点两下就两枚一样的 chip）
     var dup = state.sel.some(function (s) { return s.prompt === prompt && s.text === t; });
     if (dup) {
-      toast('这段已经在下面了');
+      toast(tr('p.selDup'));
     } else {
       state.sel.push({ label: label, prompt: prompt, text: t });
       renderChips();
@@ -3109,6 +3611,13 @@
 
   document.addEventListener('keydown', function (e) {
     if (e.key === 'Escape' && isOpen()) {
+      // 抽屉里挂着搜索词时，Esc 先清空它 —— 这个监听在**捕获阶段**（最后那个 true），
+      // 所以抢在下面所有判断之前。不然打着字按一下 Esc，整块面板就被收走了。
+      if (el.dq && el.dq.value && el.drawer.classList.contains('open')) {
+        el.dq.value = '';
+        renderHistory();
+        return;
+      }
       // 确认层 / 图片预览开着就先关它们（两种宿主里都这样，侧栏里也有这两层）
       if (isConfirmOpen()) { closeConfirm(); return; }
       if (isViewerOpen()) { closeViewer(); return; }
@@ -3163,6 +3672,9 @@
       });
     } catch (e) { /* 老环境没有这个 API，忽略 */ }
   }
+
+  // 界面语言：脚本一加载就去读（不放在 open() 里 —— 那样第一次打开会先按中文建一遍）。
+  initLang();
 
   window.__dsPanel = {
     open: open,

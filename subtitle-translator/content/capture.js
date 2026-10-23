@@ -16,6 +16,7 @@
 
   var MSG = '__dssub_capture_v1';
   var HELLO = '__dssub_hello_v1';
+  var RESET = '__dssub_reset_v1';
   var MAX_BODY = 2 * 1024 * 1024;
   var MAX_BUFFER = 24;
 
@@ -119,9 +120,25 @@
   window.addEventListener('message', function (ev) {
     if (ev.source !== window) return;
     var d = ev.data;
-    if (!d || d.__dssub !== HELLO) return;
+    if (!d) return;
+
+    /* 让隔离世界能把缓冲清空。真实用途：页面换了路由、或用户手动「重新识别」时，
+       旧字幕不该再被当成有效来源喂回来。 */
+    if (d.__dssub === RESET) {
+      buffer.length = 0;
+      seen = Object.create(null);
+      return;
+    }
+
+    if (d.__dssub !== HELLO) return;
     for (var i = 0; i < buffer.length; i++) {
-      try { window.postMessage({ __dssub: MSG, data: buffer[i] }, '*'); } catch (e) {}
+      /* 只重放「属于当前页面」的那几条。
+         缓冲是为了让晚加载的 content script 也能拿到早先抓到的字幕，但无脑全放会
+         在单页应用换路由之后把上一页的字幕文件一直喂回来 —— main.js 于是永远认为
+         「有字幕源」，L4 读屏兜底永远轮不上，用户看到的是上一页的旧字幕。 */
+      var item = buffer[i];
+      if (item && item.page && item.page !== location.href) continue;
+      try { window.postMessage({ __dssub: MSG, data: item }, '*'); } catch (e) {}
     }
   });
 })();

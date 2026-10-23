@@ -18,6 +18,8 @@
   这里不能用内联脚本 —— MV3 扩展页的 CSP 禁止，所以逻辑放在 sidepanel.js 里。
 -->
 <script src="config.js"></script>
+<!-- i18n.js 必须在 panel.js 前面：面板的文案是 build() 时取词的 -->
+<script src="i18n.js"></script>
 <script src="panel.js"></script>
 <script src="sidepanel.js"></script>
 </body>

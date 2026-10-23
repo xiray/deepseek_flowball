@@ -15,7 +15,19 @@ if (a < 0 || b < 0 || b < a) {
   console.error('✗ 在 panel.js 里定位不到渲染函数（是不是把 esc/mdToHtml 挪走了？）');
   process.exit(1);
 }
-const M = new Function(src.slice(a, b) + '\nreturn {esc:esc, mdToHtml:mdToHtml, mdToText:mdToText, dw:dw};')();
+// 面板文案在 i18n.js 里（中英两份）。这里取中文那份 —— 断言看的是结构，但用真词表能顺带
+// 验证"{name}"这类占位符没写错（写成两遍会把花括号原样漏到界面上）。
+const i18nWin = {};
+new Function('window', fs.readFileSync(path.join(__dirname, '..', 'i18n.js'), 'utf8'))(i18nWin);
+const ZH = (i18nWin.DS_I18N || {}).zh || {};
+function tr(k, vars, dflt) {
+  const v = ZH[k];
+  if (typeof v !== 'string') { return typeof dflt === 'string' ? dflt : k; }
+  return String(v).replace(/\{(\w+)\}/g, (m, x) => (vars && vars[x] != null) ? String(vars[x]) : m);
+}
+const titleText = c => (!c || !c.title || c.title === '新对话') ? tr('p.newChat') : c.title;
+
+const M = new Function('tr', src.slice(a, b) + '\nreturn {esc:esc, mdToHtml:mdToHtml, mdToText:mdToText, dw:dw};')(tr);
 
 let bad = 0;
 function t(name, md, must, mustNot) {
@@ -227,8 +239,8 @@ if (ca < 0 || cb < 0 || cc < 0 || cd < 0 || cb < ca || cd < cc) {
   process.exit(1);
 }
 const FS = { dead: {} };
-const R3 = new Function('state', src.slice(ca, cb) + '\nreturn {mergeChats:mergeChats, dropChat:dropChat};')(FS);
-const R4 = new Function('splitReco', 'A', src.slice(cc, cd) + '\nreturn {chatsToMd:chatsToMd};')(sr, { user: '我', name: 'Nova' });
+const R3 = new Function('state', 'NEW_TITLE', src.slice(ca, cb) + '\nreturn {mergeChats:mergeChats, dropChat:dropChat};')(FS, '新对话');
+const R4 = new Function('splitReco', 'A', 'tr', 'titleText', src.slice(cc, cd) + '\nreturn {chatsToMd:chatsToMd};')(sr, { user: '我', name: 'Nova' }, tr, titleText);
 
 const me = (id, up, n, tag) => ({ id: id, title: tag || id, updatedAt: up,
   messages: Array.from({ length: n }, (_, i) => ({ role: 'user', show: 'm' + i })) });
@@ -359,6 +371,58 @@ chk('导出：剥掉「推荐图片」那段标记', md.indexOf('img-reco') < 0)
 chk('导出：附件只留名字（不带全文）', md.indexOf('> 附件：a.png') > 0);
 chk('导出：带的是显示文本，不是发给模型的那份 content',
   md.indexOf('这段是发给模型的那份') < 0);
+
+console.log('\n=== 7. 上下文预算：超了从第几条开始带（ctxWindow）===');
+// 为什么单独抠出来测：这段决定了"每轮请求的前缀稳不稳"，而前缀一不稳，输入价就整段
+// 从 1/50 的命中价掉回全价。算错一个下标是要花钱的，所以让它离线可测。
+// 标记在 panel.js 里（// >>> ctxWindow / // <<< ctxWindow），挪动那段代码时别删标记。
+const wa = src.indexOf('// >>> ctxWindow');
+const wb = src.indexOf('// <<< ctxWindow');
+if (wa < 0 || wb < 0 || wb < wa) {
+  console.error('✗ 在 panel.js 里定位不到 ctxWindow（那两个标记被删了？）');
+  process.exit(1);
+}
+const W = new Function(src.slice(wa, wb) + '\nreturn {ctxWindow:ctxWindow};')();
+
+// 造消息：长度可控，且每条带 id 好认"起点是哪一条"
+const mk = (...lens) => lens.map((n, i) => ({
+  role: i % 2 ? 'assistant' : 'user', id: 'm' + i, content: 'x'.repeat(n)
+}));
+const win = (msgs, budget, keepRecent, chunk) => W.ctxWindow(msgs, budget, keepRecent, chunk || 8);
+const from = (r) => r.from;
+const lens = (r) => r.kept.map(m => m.content.length);
+
+eq('没超预算：一条都不动（前缀和上一轮完全一致 → 缓存才可能命中）',
+  from(win(mk(100, 100, 100), 1000, 2)), 0);
+eq('正好卡在预算上：还是不动（== 不算超）',
+  win(mk(500, 500), 1000, 1).kept.length, 2);
+
+// 12 条 × 100 字 = 1200 > 1000。按字数算，第 2 条往后就装不下了（下标 2）；
+// 但取整到 8 的倍数 → 起点落到 8。这就是"多丢几条换前缀稳定"。
+eq('超预算：起点按 8 取整（不是"刚好压回线下"的下标 2）',
+  from(win(mk(100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100), 1000, 2)), 8);
+eq('  取整之后确实还在预算之内（留下的 4 条 = 400 字）',
+  lens(win(mk(100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100), 1000, 2)), [100, 100, 100, 100]);
+
+// ★ 这条是整段代码存在的理由：接着又聊了两轮，起点**必须还是 8**。
+//   不取整的话这里会变成 4 —— 起点每轮都动 → 前缀每轮都变 → 缓存永久 0 命中。
+const base12 = mk(100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100);
+eq('★ 再聊两轮之后起点还是 8（同一个档 → 上一轮的请求整个成了这一轮的前缀）',
+  from(win(base12.concat(mk(100, 100)), 1000, 2)), 8);
+eq('  再多聊两轮也还在这一档',
+  from(win(base12.concat(mk(100, 100, 100, 100)), 1000, 2)), 8);
+// 一直聊到装不下 8 条尾巴了，才往上跳一整档（16），而不是一条一条挪
+eq('装不下了才跳下一档：20 条 → 起点 16（跳一大步，不是挪一格）',
+  from(win(mk(100, 100, 100, 100, 100, 100, 100, 100, 100, 100,
+             100, 100, 100, 100, 100, 100, 100, 100, 100, 100), 1000, 2)), 16);
+
+eq('最近 keepRecent 条是硬下限：预算再小也得把它们留住（取整也不许吃掉它）',
+  lens(win(mk(5000, 5000, 5000), 1000, 2)), [5000, 5000]);
+
+// 取整的代价，写出来免得以后有人以为算错了：这里只超了 100 字，
+// 但因为起点从 1 被取整到 8，最后只剩 1 条。多丢一点，换前缀稳定，值。
+eq('取整会多丢几条（这是明码标价的代价）',
+  lens(win(mk(100, 100, 100), 200, 1)), [100]);
 
 console.log('\n' + (bad ? '★ 有 ' + bad + ' 项没过' : '全部通过 ✓'));
 console.log('\n=== 截图那张表格实际渲染成什么（对话里显示的）===');

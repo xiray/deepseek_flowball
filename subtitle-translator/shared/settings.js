@@ -20,6 +20,9 @@ var DS_DEFAULTS = {
   showMode: 'zh',
   autoEnableTracks: true,
   domFallback: false,
+  screenReader: false,
+  screenRegion: 0.34,
+  screenInterval: 1500,
   fontScale: 1,
   debug: false
 };
@@ -28,6 +31,13 @@ var DS_MODELS = [
   { id: 'deepseek-flash', label: 'DeepSeek-V4.1-Flash（快，推荐）' },
   { id: 'deepseek-v4-pro', label: 'DeepSeek-V4-Pro（更准，更慢更贵）' }
 ];
+
+/*
+ * 读屏兜底强制使用的模型。只有 deepseek-flash 接受图像输入，
+ * deepseek-v4-pro 不支持——所以这一条链不受设置页的模型选择影响，
+ * 否则用户选了 pro 之后读屏会以一个费解的错误失败。
+ */
+var DS_VISION_MODEL = 'deepseek-flash';
 
 var DS_LANGS = ['简体中文', '繁體中文', '日本語', '한국어', 'English'];
 
@@ -62,6 +72,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     DS_DEFAULTS: DS_DEFAULTS,
     DS_MODELS: DS_MODELS,
+    DS_VISION_MODEL: DS_VISION_MODEL,
     DS_LANGS: DS_LANGS,
     dsMergeSettings: dsMergeSettings,
     dsLoadSettings: dsLoadSettings,

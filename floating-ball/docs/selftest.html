@@ -32,11 +32,17 @@
     __ds_chats__: [{
       id: 'test1', title: '测试对话', updatedAt: Date.now(),
       messages: [
+        // 这条用户消息**故意不写 ts**：模拟 2026-10-13 之前存下的老记录 ——
+        // 底下那条断言就靠它验"没有 ts 就不显示时间，也不拿现在糊一个假的"。
         { role: 'user', content: '网页缓存是怎么回事', show: '网页缓存是怎么回事' },
-        { role: 'assistant', content: MD, show: MD, reasoning: '概念问题，先给一张对照表，再补几条建议。' }
+        { role: 'assistant', ts: Date.now(), content: MD, show: MD,
+          reasoning: '概念问题，先给一张对照表，再补几条建议。' }
       ]
     }],
-    __ds_cur__: 'test1'
+    __ds_cur__: 'test1',
+    // 故意预置一个**老档位名**：老版本里「思考·中」存进浏览器的就是 'medium'，
+    // 而官方映射表里 medium 其实一直被当 high 跑。下面有一条断言专门盯这个迁移。
+    __ds_effort__: 'medium'
   };
   // 剪贴板的桩：无头浏览器里 navigator.clipboard 会直接抛，所以换成记录用的假货，
   // 这样才验得了"点复制到底写进去了什么"。
@@ -49,13 +55,17 @@
   } catch (e) {}
 
   var getCalls = [];
+  var storageListeners = [];    // panel.js 会注册一个：设置页改了语言 / Key，这边跟着动
   var msgListeners = [];        // panel.js 会注册一个：替侧边栏取本页内容
   window.chrome = {
     storage: {
       local: {
         get: function (k, cb) { getCalls.push(k); setTimeout(function () { cb(__store); }, 0); },
         set: function (o, cb) { Object.keys(o).forEach(function (k) { __store[k] = o[k]; }); if (cb) setTimeout(cb, 0); }
-      }
+      },
+      // 真的 chrome.storage 有 onChanged；这里给个能手动触发的桩，
+      // 才能验"在设置页切语言，面板当场跟着换"这条路（不然只能验下次打开）。
+      onChanged: { addListener: function (fn) { storageListeners.push(fn); } }
     },
     runtime: {
       sendMessage: function (m, cb) { if (cb) setTimeout(function () { cb({}); }, 0); },
@@ -82,6 +92,8 @@
 </script>
 
 <script src="../config.js"></script>
+<!-- 面板文案的词表，必须在 panel.js 前面 -->
+<script src="../i18n.js"></script>
 <script src="../panel.js"></script>
 <script src="../content.js"></script>
 
@@ -152,11 +164,17 @@
       out.push('   工具条: ' + tools.join(' , '));
     });
 
-    t('思考强度下拉有 4 档', function () {
+    t('思考强度下拉：4 档，都是官方认的值，且老档位名会被迁移掉', function () {
       var e = sr.querySelector('#effort');
       var labels = Array.prototype.map.call(e.options, function (o) { return o.textContent + '=' + o.value; });
-      if (labels.length < 2) { throw new Error('只有 ' + labels.length + ' 个'); }
+      var vals = Array.prototype.map.call(e.options, function (o) { return o.value; }).join(',');
       out.push('   ' + labels.join('  '));
+      out.push('   预置的老值 = medium，面板上实际选中 = ' + e.value);
+      if (labels.length !== 4) { throw new Error('不是 4 档：' + labels.length); }
+      // 官方 reasoning_effort 只认 low/high/max，「不思考」靠 thinking:{type:disabled} 表达
+      if (vals !== 'none,low,high,max') { throw new Error('档位不是 none/low/high/max：' + vals); }
+      // 老配置里存的 'medium' 实际跑的就是 high —— 必须迁移成 high（否则会留在列表外，下拉框选不中）
+      if (e.value !== 'high') { throw new Error('老值 medium 没迁移成 high，实际选中 = ' + e.value); }
     });
 
     t('模型下拉有内容', function () {
@@ -259,12 +277,195 @@
       if (!Array.isArray(got.images)) { throw new Error('images 不是数组'); }
     });
 
+    // 抓可见文字这次换成了"元素剪枝"（视口外的整块不往里翻，一个 3 万节点的页面
+    // 从 2.6 万次量位置框降到 2000 次）。下面两条是它的回归保护：
+    // 顺序不能乱（原来按文本节点走，本来就是文档顺序）、视口外的不许收。
+    t('抓可见文字：顺序仍是文档顺序（甲<span>乙</span>丙 收成 甲/乙/丙）', function () {
+      var y0 = window.pageYOffset || 0;
+      window.scrollTo(0, 0);
+      var wrap = document.createElement('div');
+      wrap.innerHTML = '<p>顺序甲<span>顺序乙</span>顺序丙</p>';
+      document.body.insertBefore(wrap, document.body.firstChild);
+      var far = document.createElement('div');
+      far.setAttribute('style', 'position:absolute;left:0;top:20000px');
+      far.textContent = '屏幕外的字CANARY不该被收';
+      document.body.appendChild(far);
+
+      var got = null;
+      msgListeners.forEach(function (fn) { fn({ type: 'ds-grab-page' }, {}, function (r) { got = r; }); });
+      var v = (got && got.visible) || '';
+
+      document.body.removeChild(wrap);
+      document.body.removeChild(far);
+      window.scrollTo(0, y0);
+
+      var i1 = v.indexOf('顺序甲'), i2 = v.indexOf('顺序乙'), i3 = v.indexOf('顺序丙');
+      var far2 = v.indexOf('CANARY');
+      out.push('   可见文字 ' + v.length + ' 字，前 40 = ' + JSON.stringify(v.slice(0, 40)));
+      out.push('   位置  甲=' + i1 + '  乙=' + i2 + '  丙=' + i3 + '   屏幕外的 CANARY=' + far2);
+      if (i1 < 0 || i2 < 0 || i3 < 0) { throw new Error('视口内的字没收全：' + i1 + '/' + i2 + '/' + i3); }
+      if (!(i1 < i2 && i2 < i3)) { throw new Error('顺序乱了：甲/乙/丙 = ' + i1 + '/' + i2 + '/' + i3); }
+      if (far2 >= 0) { throw new Error('屏幕外的东西被收进来了'); }
+    });
+
     t('代码块包在 .codewrap 里，按钮不随横向滚动跑', function () {
       var pre = sr.querySelector('.codewrap pre');
       if (!pre) { throw new Error('pre 没包进 codewrap'); }
       var pos = getComputedStyle(sr.querySelector('.codewrap')).position;
       out.push('   .codewrap position = ' + pos);
       if (pos !== 'relative') { throw new Error('不是 relative，按钮定位会跑偏'); }
+    });
+
+    // ---- 这一轮新加的两样：气泡上的「重试」、抽屉里的搜索 ----
+    t('每条 AI 回答都有「重试」，而且不和「复制」叠在一起', function () {
+      var ai = sr.querySelector('.row.ai .bubble');
+      if (!ai) { throw new Error('没有 AI 气泡'); }
+      var rt = ai.querySelector('.cp-retry');
+      var cp = ai.querySelector('.cp-msg:not(.cp-retry)');
+      if (!rt) { throw new Error('AI 气泡上没有 .cp-retry'); }
+      if (!cp) { throw new Error('AI 气泡上没有复制按钮'); }
+      if (rt.textContent !== '重试') { throw new Error('按钮文字是 ' + JSON.stringify(rt.textContent)); }
+      if (ai.querySelectorAll('.cp-retry').length !== 1) { throw new Error('重试按钮重复了'); }
+      // 两个按钮都靠 right 定位，写错顺序就会原地重叠 —— 这条断言专门盯它
+      var rr = rt.getBoundingClientRect(), cr = cp.getBoundingClientRect();
+      out.push('   重试 ' + Math.round(rr.left) + '..' + Math.round(rr.right) +
+               '   复制 ' + Math.round(cr.left) + '..' + Math.round(cr.right));
+      if (!rr.width) { throw new Error('重试按钮宽度是 0（多半没显示）'); }
+      if (rr.right > cr.left + 1) { throw new Error('两个按钮叠在一起了'); }
+      // 命中测试：合成事件是直接打在元素上的，绕过遮挡判定 —— 只有这条能证明"真鼠标点得到"。
+      // ⚠ 坑：getBoundingClientRect 给的是**几何位置**，滚动容器把它裁掉了也照样有坐标。
+      //   长回答会把这条气泡顶到可视区外（实测 top=23，而面板在 y≥259），
+      //   这时候 elementFromPoint 必然落空 —— 那是假失败。所以先把列表滚到顶再测。
+      var listEl = sr.querySelector('#list');
+      var savedTop = listEl.scrollTop;
+      listEl.scrollTop = 0;
+      var rr2 = rt.getBoundingClientRect();
+      var px = rr2.left + rr2.width / 2, py = rr2.top + rr2.height / 2;
+      var hit = sr.elementFromPoint(px, py);
+      listEl.scrollTop = savedTop;
+      out.push('   滚到顶后按钮中心 = (' + Math.round(px) + ',' + Math.round(py) + ')，' +
+               '那一点上命中的是 = ' + (hit ? (hit.className || hit.id || hit.tagName) : 'null'));
+      if (!hit || !(hit === rt || rt.contains(hit))) {
+        throw new Error('重试按钮那一点命中的不是它自己 → 真鼠标点不到');
+      }
+    });
+
+    t('历史抽屉有搜索框：能过滤，搜不到时有提示，清空就恢复', function () {
+      var dw = sr.querySelector('.drawer');
+      var dq = sr.querySelector('#dq');
+      if (!dq) { throw new Error('抽屉里没有搜索框 #dq'); }
+      if (!dw.classList.contains('open')) { sr.querySelector('#history').click(); }
+      var wasOpen = dw.classList.contains('open');
+
+      var nAll = sr.querySelectorAll('#dlist .hitem').length;
+
+      dq.value = '缓存';                                    // 命中：标题是"测试对话"，但正文里有"缓存"
+      dq.dispatchEvent(new Event('input'));
+      var nHit = sr.querySelectorAll('#dlist .hitem').length;
+
+      dq.value = '绝不可能出现的词zzzq';                     // 不命中
+      dq.dispatchEvent(new Event('input'));
+      var nMiss = sr.querySelectorAll('#dlist .hitem').length;
+      var missTxt = sr.querySelector('#dlist').textContent;
+
+      dq.value = '';
+      dq.dispatchEvent(new Event('input'));
+      var nBack = sr.querySelectorAll('#dlist .hitem').length;
+
+      out.push('   抽屉开=' + wasOpen + '  全部 ' + nAll + ' 条' +
+               ' → 搜"缓存" ' + nHit + ' 条 → 搜乱码 ' + nMiss + ' 条 → 清空 ' + nBack + ' 条');
+      out.push('   搜不到时显示： ' + JSON.stringify(missTxt.slice(0, 40)));
+
+      dw.classList.remove('open');
+      if (!wasOpen) { throw new Error('点历史按钮没拉开抽屉'); }
+      if (nAll < 1) { throw new Error('抽屉里一条对话都没有'); }
+      if (nHit !== 1) { throw new Error('搜"缓存"该命中 1 条（正文里有），实际 ' + nHit); }
+      if (nMiss !== 0) { throw new Error('搜乱码该 0 条，实际 ' + nMiss); }
+      if (nBack !== nAll) { throw new Error('清空搜索词后没恢复：' + nBack + ' ≠ ' + nAll); }
+      if (missTxt.indexOf('没有对得上') < 0) { throw new Error('搜不到时没有任何提示'); }
+    });
+
+    // ---- 这一轮新加的两样：气泡底部的时间、输入框 ↑ 翻自己发过的话 ----
+    t('AI 气泡底部有 HH:MM，老记录没 ts 就不显示', function () {
+      var ai = sr.querySelector('.row.ai .bubble .time');
+      if (!ai) { throw new Error('AI 气泡上没有 .time'); }
+      out.push('   AI 那条时间 = ' + JSON.stringify(ai.textContent) +
+               '   （悬停看完整时间：' + JSON.stringify(String(ai.title).slice(0, 16)) + '…）');
+      if (!/^\d{2}:\d{2}$/.test(ai.textContent)) {
+        throw new Error('时间格式不是 HH:MM：' + JSON.stringify(ai.textContent));
+      }
+      // 种子数据里那条用户消息故意没写 ts（老记录）→ 它不该显示时间
+      if (sr.querySelector('.row.me .bubble .time')) {
+        throw new Error('没有 ts 的老记录也显示了时间（不能拿"现在"糊一个假的）');
+      }
+    });
+
+    t('输入框 ↑ 回填上一条自己发的话，↓ 把刚打的半句还回来', function () {
+      var inp = sr.querySelector('#input');
+      inp.focus();
+      inp.value = '打了一半的话';
+      inp.setSelectionRange(inp.value.length, inp.value.length);
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      out.push('   按 ↑ → ' + JSON.stringify(inp.value));
+      if (inp.value !== '网页缓存是怎么回事') { throw new Error('↑ 没回填上一条'); }
+      // 已经翻到最早那条，再按一次：还是它（不能跳走，也不能清空）
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+      if (inp.value !== '网页缓存是怎么回事') {
+        throw new Error('翻到头之后再按 ↑ 被改掉了：' + JSON.stringify(inp.value));
+      }
+      inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+      out.push('   按 ↓ → ' + JSON.stringify(inp.value));
+      if (inp.value !== '打了一半的话') { throw new Error('↓ 没把刚才那半句还回来'); }
+      // 收工：清空 + 发一次 input（手打一个字就该退出"翻历史"状态）
+      inp.value = '';
+      inp.dispatchEvent(new Event('input'));
+    });
+
+    // ---- 界面语言：整块切英文 / 切回中文（2026-10-20 新加）----
+    // 放在最后：relang() 是**把整个面板拆了重建**（build() 一次性 innerHTML），
+    // 前面抓的 sr / input / send 全都会指向已经离场的旧节点 —— 必须重新取。
+    function setLang(v) {
+      __store.__ds_lang__ = v;
+      storageListeners.forEach(function (fn) { fn({ __ds_lang__: { newValue: v } }, 'local'); });
+    }
+
+    t('切到英文：整块变英文，输入框的字和抽屉状态都不丢', function () {
+      // 先造一点"用户状态"——换语言不能把这些冲掉
+      sr.querySelector('#input').value = 'draft text';
+      sr.querySelector('#history').click();
+      if (!sr.querySelector('#drawer').classList.contains('open')) { throw new Error('抽屉没拉开，测不了'); }
+
+      setLang('en');
+      host = document.getElementById('__ds_float_panel__');
+      sr = host.shadowRoot;
+
+      var ph = sr.querySelector('#input').placeholder;
+      var nw = sr.querySelector('#new').textContent;
+      var sd = sr.querySelector('#send').title;
+      var dh = sr.querySelector('.dhead span').textContent;
+      var ef = sr.querySelector('#effort').options[0].textContent;
+      out.push('   占位符 ' + JSON.stringify(ph) + ' / 新对话 ' + JSON.stringify(nw) +
+               ' / 抽屉 ' + JSON.stringify(dh) + ' / 档位 ' + JSON.stringify(ef));
+      if (ph !== 'Ask me anything') { throw new Error('占位符还是 ' + JSON.stringify(ph)); }
+      if (nw !== 'New chat') { throw new Error('「新对话」还是 ' + JSON.stringify(nw)); }
+      if (sd !== 'Send') { throw new Error('发送按钮 title 还是 ' + JSON.stringify(sd)); }
+      if (dh !== 'History') { throw new Error('抽屉标题还是 ' + JSON.stringify(dh)); }
+      if (ef !== 'No thinking') { throw new Error('思考档位还是 ' + JSON.stringify(ef)); }
+      if (sr.querySelector('#input').value !== 'draft text') { throw new Error('换语言把输入框里的字弄丢了'); }
+      if (!sr.querySelector('#drawer').classList.contains('open')) { throw new Error('换语言把抽屉关上了'); }
+    });
+
+    t('切回中文：文案复原（不是只改了一半）', function () {
+      setLang('zh');
+      host = document.getElementById('__ds_float_panel__');
+      sr = host.shadowRoot;
+      var ph = sr.querySelector('#input').placeholder;
+      var nw = sr.querySelector('#new').textContent;
+      if (ph !== '畅所欲问') { throw new Error('占位符没切回来：' + JSON.stringify(ph)); }
+      if (nw !== '新对话') { throw new Error('「新对话」没切回来：' + JSON.stringify(nw)); }
+      if (sr.querySelector('#input').value !== 'draft text') { throw new Error('切回来把输入框的字弄丢了'); }
+      sr.querySelector('#input').value = '';
+      sr.querySelector('#drawer').classList.remove('open');
     });
 
     t('关闭面板后球该回来', function () {

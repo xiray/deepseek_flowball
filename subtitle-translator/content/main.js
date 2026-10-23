@@ -57,7 +57,8 @@
     });
 
     if (s.domFallback) startDomWatch(); else stopDomWatch();
-    if (!s.enabled) { DS_OVERLAY.hide(); stopDomWatch(); }
+    if (!s.screenReader) DS_VISION.stop();
+    if (!s.enabled) { DS_OVERLAY.hide(); stopDomWatch(); DS_VISION.stop(); }
   }
 
   chrome.storage.local.get(null, function (stored) {
@@ -346,6 +347,20 @@
     }
 
     var t = Number(v.currentTime) || 0;
+
+    /* L4 读屏兜底：只有在一条字幕源都没拿到时才接管。它一接管，覆盖层就完全归
+       DS_VISION 管 —— 那条链是「当前这一句」，不参与 cues 数组，也没法预取。 */
+    if (state.settings.screenReader && state.kind === 'none') {
+      DS_VISION.setOptions({
+        region: Number(state.settings.screenRegion) || 0.34,
+        minGap: Number(state.settings.screenInterval) || 1500,
+        debug: !!state.settings.debug
+      });
+      DS_VISION.pump(v);
+      return;
+    }
+    DS_VISION.stop();
+
     var cue = DS_PARSE.cueAt(state.cues, t);
 
     if (cue && cue.zh) DS_OVERLAY.show(cue.zh, cue.text);
@@ -370,11 +385,17 @@
     }
     var done = 0;
     for (var i = 0; i < state.cues.length; i++) if (state.cues[i].zh) done++;
+    var vs = DS_VISION.snapshot();
+    /* 「读屏兜底」这个来源名只在它真的在顶上干活时才能用。DS_VISION 可能因为
+       上一帧还是 none 而仍在运行，这一帧已经拿到真字幕了 —— 那种情况下要如实
+       报字幕文件，否则用户会以为扩展在烧钱读屏。 */
+    var onScreen = !!vs.active && state.kind === 'none';
     sendResponse({
       ok: true,
       hasVideo: true,
       kind: state.kind,
-      source: state.sourceLabel,
+      source: onScreen ? '读屏兜底（视觉识别）' : state.sourceLabel,
+      screen: vs,
       total: state.cues.length,
       done: done,
       playing: !v.paused,

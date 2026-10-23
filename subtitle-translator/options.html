@@ -91,6 +91,24 @@
       <span>DOM 兜底模式<em>对没有任何字幕文件、字幕由播放器自己画在页面上的站点生效。只能拿到「当前这一句」，无法提前翻译，中文大概率慢半拍。默认关闭。</em></span>
     </label>
     <label class="check">
+      <input type="checkbox" id="screenReader">
+      <span>读屏兜底 —— 一条字幕源都没有时，直接读画面<em>上面三层都拿不到字幕时，把画面底部截下来交给 DeepSeek 的视觉能力，让它既认字又翻译。<b>这会把画面内容发到 DeepSeek，而且是持续发出的请求，按小时计会产生真实费用；译文也必然慢半拍。</b>默认关闭。</em></span>
+    </label>
+    <div class="grid" style="margin-top:14px">
+      <label class="field">
+        <span>截取画面底部比例</span>
+        <input id="screenRegion" type="number" min="0.1" max="1" step="0.02">
+      </label>
+      <label class="field">
+        <span>两次请求最小间隔（毫秒）</span>
+        <input id="screenInterval" type="number" min="500" max="10000" step="100">
+      </label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button type="button" class="ghost" id="testVision">测试读屏</button>
+      <span class="hint" id="visionOut" style="margin:0">读屏固定用 DeepSeek-V4.1-Flash —— 只有它接受图像输入。</span>
+    </div>
+    <label class="check">
       <input type="checkbox" id="debug">
       <span>控制台调试日志<em>打开后可在页面 DevTools 里看到字幕源切换和批次日志。</em></span>
     </label>
@@ -113,6 +131,9 @@
       <li>打开带英文字幕的视频页，<b>先在播放器里把字幕（CC）打开</b>——扩展抓的是播放器自己下载的那份字幕文件，不开就不会有请求。</li>
       <li>字幕一加载，中文就会叠在画面上。右上角扩展图标能看到当前用的是哪一级字幕源。</li>
       <li>如果某个站点没有反应，点扩展图标看「字幕来源」；显示「未检测到视频」或来源一直为空，就是这一站的字幕既不是文件也不是原生轨。</li>
+      <li>遇到<b>硬字幕</b>（字幕直接烧进画面、根本没有独立的字幕文件可抓，或字幕被加密下发）时，
+        打开上面的「读屏兜底」——前三级都拿不到源时，扩展会转去读画面底部那一条，
+        让视觉模型自己认字并翻译。它比前三层贵、也慢半拍，而且会把画面截图发给 DeepSeek。</li>
     </ol>
   </section>
 

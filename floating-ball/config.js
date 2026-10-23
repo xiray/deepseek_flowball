@@ -60,16 +60,20 @@ window.DS_CONFIG = {
     { label: 'V4 Flash', id: 'deepseek-v4-flash', vision: true }   // 旧名，官方仍接受，实际由 V4.1-Flash 服务
   ],
 
-  // 思考强度（发给接口的 reasoning_effort），面板右下角那个下拉框就是这份列表：
-  //   none          = 不思考，直接给答案（最快、最省，适合翻译/改错字这种）
-  //   low/medium/high = 想得越来越多（默认这档就够；数学题、写代码可以调到 high）
+  // 思考强度，面板右下角那个下拉框就是这份列表。
+  // ⚠ 这是照官方现行文档纠正过的版本（2026-10-08）。原来那套是错的，两个坑：
+  //   · 接口的 reasoning_effort **只认 low / high / max**。「不思考」不是发 none
+  //     ——那个值不在合法列表里、会被**静默忽略**，模型照旧思考（钱照花、还慢）；
+  //     真正的关法是发 thinking:{type:'disabled'}（panel.js 的 withEffort 负责拼）。
+  //   · 官方映射表里 requested 的 medium / xhigh 都会被**归到 high** ——
+  //     原来那个「思考·中」其实一直跑的是「思考·高」，名字骗人，已经删掉。
   // 想改档位就动这里：label 是显示的文字，id 是真正发给接口的值，删掉不想要的整行即可。
-  effort: 'medium',
+  effort: 'high',
   efforts: [
-    { label: '不思考', id: 'none' },
+    { label: '不思考', id: 'none' },     // 翻译、改错字、查个东西：最省也最快
     { label: '思考·低', id: 'low' },
-    { label: '思考·中', id: 'medium' },
-    { label: '思考·高', id: 'high' }
+    { label: '思考·高', id: 'high' },
+    { label: '思考·最强', id: 'max' }
   ],
 
   // ------------------------------------------------------------

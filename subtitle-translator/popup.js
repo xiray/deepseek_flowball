@@ -32,52 +32,63 @@
     });
   }
 
+  function idle(msg) {
+    $('stState').textContent = msg;
+    $('stSource').textContent = '—';
+    $('stProgress').textContent = '—';
+    $('stLatency').textContent = '—';
+    $('stErrLine').hidden = true;
+    $('stScreenLine').hidden = true;
+    $('stTitle').textContent = '';
+  }
+
   function renderStatus(r) {
     var state = $('stState'), source = $('stSource'),
         prog = $('stProgress'), lat = $('stLatency'),
-        errLine = $('stErrLine'), err = $('stErr'), title = $('stTitle');
+        errLine = $('stErrLine'), err = $('stErr'),
+        title = $('stTitle'),
+        screenLine = $('stScreenLine'), screen = $('stScreen');
 
-    if (!settings || !settings.enabled) {
-      state.textContent = '已暂停';
-      source.textContent = '—';
-      prog.textContent = '—';
-      lat.textContent = '—';
-      errLine.hidden = true;
-      title.textContent = '';
-      return;
-    }
+    if (!settings || !settings.enabled) { idle('已暂停'); return; }
 
     if (!r) {
-      state.textContent = '此页面未注入';
-      source.textContent = '—';
-      prog.textContent = '—';
-      lat.textContent = '—';
-      errLine.hidden = true;
+      idle('此页面未注入');
       title.textContent = '刷新页面后重试';
       return;
     }
 
+    var vs = r.screen || {};
+
     if (!r.hasVideo) {
-      state.textContent = '未检测到视频';
-      source.textContent = '—';
-      prog.textContent = '—';
-      title.textContent = '';
+      idle('未检测到视频');
     } else {
       var p = r.pipeline || {};
-      if (r.total === 0) {
-        state.textContent = '等字幕轨';
-        source.textContent = r.source || '尚未捕获';
-        prog.textContent = '0 条';
+      if (vs.active) {
+        /* 读屏模式下 cues 一直是空的，不能按「等字幕轨」显示 —— 那会让人以为卡住了。 */
+        state.textContent = r.playing ? '读屏运行中' : '已暂停播放';
+        source.textContent = r.source || '读屏兜底';
+        prog.textContent = '已发 ' + (vs.sent || 0) + ' 次';
+        screenLine.hidden = false;
+        screen.textContent = '命中 ' + (vs.ok || 0) + ' · 跳过 ' + (vs.skipped || 0) +
+          (vs.mode === 'tab' ? ' · 标签页截图' : '') +
+          (vs.inflight ? ' · 请求中' : '');
       } else {
-        state.textContent = r.playing ? '运行中' : '已暂停播放';
-        source.textContent = r.source || '—';
-        prog.textContent = r.done + ' / ' + r.total + ' 条';
+        screenLine.hidden = true;
+        if (r.total === 0) {
+          state.textContent = '等字幕轨';
+          source.textContent = r.source || '尚未捕获';
+          prog.textContent = '0 条';
+        } else {
+          state.textContent = r.playing ? '运行中' : '已暂停播放';
+          source.textContent = r.source || '—';
+          prog.textContent = r.done + ' / ' + r.total + ' 条';
+        }
       }
       lat.textContent = p.lastLatency ? (p.lastLatency + ' ms') : '—';
       title.textContent = r.title || '';
     }
 
-    var e = (r.pipeline && r.pipeline.lastError) || '';
+    var e = (vs.active && vs.note) || (r.pipeline && r.pipeline.lastError) || '';
     if (e) { errLine.hidden = false; err.textContent = e; }
     else errLine.hidden = true;
   }

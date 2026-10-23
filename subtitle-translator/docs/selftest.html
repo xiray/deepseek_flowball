@@ -36,6 +36,7 @@
 <div id="repF" data-title="F. 端到端：抓取 → 翻译 → 渲染（main.js）"></div>
 <div id="repG" data-title="G. 界面与清单契约"></div>
 <div id="repH" data-title="H. 设置页 / 弹窗真的跑起来（用真实 markup + 真实 js）"></div>
+<div id="repI" data-title="I. 读屏兜底：视觉请求 + 抓帧省钱（vision.js / background.js）"></div>
 <div id="stage">boot</div>
 
 <script>
@@ -185,6 +186,7 @@ function showRaw(box) { box.textContent = String(box.textContent || '').slice(0,
 <script src="../content/parse.js"></script>
 <script src="../content/overlay.js"></script>
 <script src="../content/pipeline.js"></script>
+<script src="../content/vision.js"></script>
 <script src="../content/capture.js"></script>
 <script src="../background.js"></script>
 
@@ -283,6 +285,7 @@ function showRaw(box) { box.textContent = String(box.textContent || '').slice(0,
   var C = mkReport('repC');
 
   var v1 = document.createElement('video');
+  v1.id = 'selftest-v1';
   v1.style.cssText = 'position:fixed;left:24px;top:24px;width:640px;height:360px;background:#000';
   document.body.appendChild(v1);
   await wait(60);
@@ -584,7 +587,9 @@ function showRaw(box) { box.textContent = String(box.textContent || '').slice(0,
   var epVtt = 'WEBVTT\n\n00:00:00.500 --> 00:00:02.500\nHello world\n\n' +
     '00:00:02.500 --> 00:00:04.500\nSecond line\n\n' +
     '00:00:04.500 --> 00:00:06.500\nThird line\n';
-  window.postMessage({ __dssub: '__dssub_capture_v1', data: { url: 'https://host/ep.vtt', body: epVtt } }, '*');
+  /* page 必须跟当前地址一致 —— capture.js 只重放属于当前页面的缓冲，
+     对不上就会被当成「换路由之前的旧字幕」丢掉。 */
+  window.postMessage({ __dssub: '__dssub_capture_v1', data: { url: 'https://host/ep.vtt', body: epVtt, page: location.href } }, '*');
 
   __store.enabled = true;
   __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
@@ -647,7 +652,8 @@ function showRaw(box) { box.textContent = String(box.textContent || '').slice(0,
   var files = {};
   var names = ['options.html', 'options.js', 'popup.html', 'popup.js',
     'background.js', 'shared/settings.js', 'content/parse.js',
-    'content/overlay.js', 'content/pipeline.js', 'content/main.js', 'content/capture.js'];
+    'content/overlay.js', 'content/pipeline.js', 'content/vision.js',
+    'content/main.js', 'content/capture.js'];
   for (var fi = 0; fi < names.length; fi++) {
     files[names[fi]] = await pull('../' + names[fi]);
   }
@@ -814,6 +820,400 @@ function showRaw(box) { box.textContent = String(box.textContent || '').slice(0,
 
   /* 弹窗里挂了 setInterval 轮询状态，所以这个 holder 不能删——
      删了之后轮询拿到 null 会抛异常，反过来把汇总条刷成"脚本异常"。 */
+
+  /* ===================== I. 读屏兜底 ===================== */
+  stage('I 读屏兜底');
+  var I = mkReport('repI');
+
+  /* --- I1. 后台的视觉请求 --- */
+  var vCalls = [];
+  window.fetch = function (url, init) {
+    vCalls.push({ url: String(url), init: init || {}, body: init && init.body ? JSON.parse(init.body) : null });
+    var content = (window.__visionReply !== undefined)
+      ? window.__visionReply
+      : '{"found":true,"src":"The quick brown fox","zh":"敏捷的棕色狐狸"}';
+    return Promise.resolve({
+      ok: true, status: 200,
+      text: function () {
+        return Promise.resolve(JSON.stringify({
+          model: 'deepseek-flash',
+          choices: [{ message: { content: content } }],
+          usage: { prompt_tokens: 120, completion_tokens: 18 }
+        }));
+      }
+    });
+  };
+
+  var tinyJpeg = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==';
+
+  __store.apiKey = 'sk-sample0123456789abcdefWXYZ';
+  __store.enabled = true;              // H 块最后把总开关关过，这里必须恢复，否则覆盖层直接被 hide
+  __store.screenReader = true;
+  __store.showMode = 'zh';
+  __changeListeners.forEach(function (fn) {
+    fn({ enabled: { newValue: true }, screenReader: { newValue: true } }, 'local');
+  });
+  await wait(250);
+  var bg2 = __msgListeners[0];
+
+  var vResp = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('视觉请求返回成功', vResp && vResp.ok === true, J(vResp && vResp.error));
+  I('解析出原文和译文',
+    vResp && vResp.found === true && vResp.src === 'The quick brown fox' && vResp.zh === '敏捷的棕色狐狸',
+    J(vResp && { s: vResp.src, z: vResp.zh }));
+
+  var vcall = vCalls[vCalls.length - 1];
+  I('content 是数组而不是字符串',
+    !!vcall && Array.isArray(vcall.body.messages[1].content), typeof (vcall && vcall.body.messages[1].content));
+  I('第 1 个块是文字提示',
+    !!vcall && vcall.body.messages[1].content[0].type === 'text',
+    vcall && vcall.body.messages[1].content[0].type);
+  I('第 2 个块是 image_url 且带上原图',
+    !!vcall && vcall.body.messages[1].content[1].type === 'image_url' &&
+      vcall.body.messages[1].content[1].image_url.url === tinyJpeg,
+    vcall && vcall.body.messages[1].content[1].type);
+  I('视觉请求强制用 deepseek-flash（只有它接受图像）',
+    !!vcall && vcall.body.model === 'deepseek-flash', vcall && vcall.body.model);
+  I('视觉请求也关了 thinking', !!vcall && vcall.body.thinking && vcall.body.thinking.type === 'disabled',
+    vcall && J(vcall.body.thinking));
+  I('图片只能出现在 user 消息里（system 里放图会 400）',
+    !!vcall && typeof vcall.body.messages[0].content === 'string',
+    vcall && typeof vcall.body.messages[0].content);
+
+  var modelBefore = __store.model;
+  __store.model = 'deepseek-v4-pro';
+  vCalls.length = 0;
+  var vResp2 = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('用户选了 v4-pro 也不影响读屏（仍然发 flash）',
+    vResp2 && vResp2.ok && vCalls[0].body.model === 'deepseek-flash',
+    vCalls[0] && vCalls[0].body.model);
+  __store.model = modelBefore;
+
+  window.__visionReply = '{"found":false,"src":"","zh":""}';
+  var vNone = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('画面里没字幕 → found=false，不产生假译文',
+    vNone && vNone.ok === true && vNone.found === false && !vNone.zh, J(vNone && { f: vNone.found, z: vNone.zh }));
+
+  window.__visionReply = '```json\n{"found":true,"src":"Hello","zh":"你好"}\n```';
+  var vFence = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('模型把 JSON 裹进代码块也能解析出来',
+    vFence && vFence.ok && vFence.zh === '你好', J(vFence && vFence.zh));
+
+  window.__visionReply = '画面里写着 Hello world。';
+  var vBad = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('模型不按 JSON 回时宁可报错，也不把整段话糊到画面上',
+    vBad && !vBad.ok && /无法解析/.test(vBad.error), vBad && vBad.error);
+  window.__visionReply = undefined;
+
+  window.fetch = function () {
+    return Promise.resolve({
+      ok: false, status: 401,
+      text: function () { return Promise.resolve(JSON.stringify({ error: { message: 'Auth Fails' } })); }
+    });
+  };
+  var v401 = await new Promise(function (res) {
+    bg2({ type: 'ds-translate-image', image: tinyJpeg }, {}, res);
+  });
+  I('读屏的 401 也转成人话', v401 && !v401.ok && /API Key 无效/.test(v401.error), v401 && v401.error);
+  window.fetch = realFetch;
+
+  /* --- I2. 抓帧与省钱策略（真 canvas，真差分） --- */
+
+  /* 页面里还挂着前面几块留下的视频，而 main.js 的主循环一直在跟着当前最大的那个。
+     不收拾干净的话，读屏会去读 C 块那块 v1，而不是这里要测的 vv。 */
+  var strays = document.querySelectorAll('video');
+  for (var si = 0; si < strays.length; si++) {
+    if (strays[si].parentNode) strays[si].parentNode.removeChild(strays[si]);
+  }
+
+  /* F 块投过一份字幕，capture.js 会把它缓在内存里，main.js 每次 askCapture()
+     （换视频、页面加载时各调一次）都会收到重放 —— 于是 kind 永远是 'file'，
+     读屏永远不接管。这里把缓冲清空，才是真正意义上的「页面上没有字幕源」。
+     另外删光 video 会让 pickVideo() 走 resetCues()，kind 一并回到 none。 */
+  window.postMessage({ __dssub: '__dssub_reset_v1' }, '*');
+  await wait(500);
+
+  /* 给测试视频喂真实像素。
+     不要试图去 patch CanvasRenderingContext2D.prototype.drawImage 来「假装画了东西」——
+     实测在 headless 里，被代理画进 canvas 的内容 getImageData 读不出来，
+     指纹永远等于背景色，差分恒为 0，会把人骗到怀疑自己的算法。
+     正路是 canvas.captureStream() 做成一个 MediaStream 塞给 video，
+     这样 drawImage(video) 拿到的是真帧，跟真实播放时一模一样。 */
+  var srcCanvas = document.createElement('canvas');
+  srcCanvas.width = 640;
+  srcCanvas.height = 360;
+  var srcCtx = srcCanvas.getContext('2d');
+  var frame = 0;
+  function paintSource() {
+    srcCtx.fillStyle = '#101010';
+    srcCtx.fillRect(0, 0, 640, 360);
+    /* 画在底部 34% 那一条里（y≈238..360），也就是 vision.js 实际会抓的区域。 */
+    srcCtx.fillStyle = '#ffffff';
+    var w = Math.max(40, 80 + Math.floor(frame / 3) * 45);
+    srcCtx.fillRect(30, 300, w, 48);
+  }
+  paintSource();
+
+  var vv = document.createElement('video');
+  vv.id = 'selftest-v2';
+  vv.style.cssText = 'position:fixed;left:20px;top:20px;width:560px;height:315px;background:#000';
+  vv.muted = true;
+  vv.playsInline = true;
+  vv.srcObject = srcCanvas.captureStream(30);
+  document.body.appendChild(vv);
+  Object.defineProperty(vv, 'currentTime', { value: 0, configurable: true, writable: true });
+
+  var playErr = '';
+  try { vv.play().catch(function (e) { playErr = String(e && e.message); }); } catch (e) { playErr = String(e); }
+  await wait(900);
+  I('测试视频已就绪（captureStream 喂帧成功）',
+    vv.readyState >= 2 && vv.videoWidth === 640,
+    'readyState=' + vv.readyState + ' ' + vv.videoWidth + 'x' + vv.videoHeight +
+    (playErr ? ' playErr=' + playErr : ''));
+  I('测试视频处于播放态（读屏才会工作）', vv.paused === false, 'paused=' + vv.paused);
+
+  var vSent = [];
+  var vLast = '';
+  __reply = function (msg) {
+    if (msg.type !== 'ds-translate-image') return { ok: true };
+    vLast = String(msg.image || '');     // 不论什么时序，最后一发总是留在这里
+    vSent.push(msg.image);
+    return { ok: true, found: true, src: 'Frame', zh: '第 ' + vSent.length + ' 帧', elapsedMs: 120 };
+  };
+
+  /* 从这一刻起由测试接管节奏。
+     screenReader 必须保持 true —— 一旦置 false，主循环 250ms 后就会 DS_VISION.stop()，
+     这里刚 pump 起来的读屏立刻死掉。所以改用 minGap 这个闸门：调到一个很大的值，
+     主循环那几拍因为「离上次发送还不够久」全部跳过，节奏就只剩 forceStep() 一只手上。
+     （等一下还要把它改回小值，专门去测「换句后立刻重发」。） */
+  __store.screenReader = true;
+  __changeListeners.forEach(function (fn) { fn({ screenReader: { newValue: true } }, 'local'); });
+  DS_OVERLAY.attach(vv);
+  DS_VISION.setOptions({ region: 0.34, minGap: 600000, debug: false });
+  DS_VISION.pump(vv);
+  await wait(400);                       // 打稳首帧基线（第一帧 lastDiff 恒为 1）
+  vSent.length = 0;
+  I('读屏启动后进入运行态', DS_VISION.isRunning() === true);
+
+  /* 每一轮抓帧都要把视频画进 canvas，单帧几十毫秒；用固定间隔等它，等于跟主循环、
+     250ms 渲染开销抢时间。用一个「推进到抓到的帧数」的小循环，测的才是行为本身。 */
+  async function pumpFrames(n, budgetMs) {
+    var target = DS_VISION.snapshot().grabs + n;
+    var deadline = Date.now() + (budgetMs || 6000);
+    while (DS_VISION.snapshot().grabs < target && Date.now() < deadline) {
+      DS_VISION.forceStep();
+      await wait(140);
+    }
+    return DS_VISION.snapshot();
+  }
+
+  var s0 = await pumpFrames(1);
+  I('确实抓到了帧', s0.grabs > 0, 'grabs=' + s0.grabs);
+  /* 抓帧和发请求是两步：grab 回调里才会 send()。等 grabs 涨了不等于请求已经出去。
+     这里以「本阶段的 sent 基线」为准：放开闸门后一直 forceStep 到 sent 真的增长，
+     再看那一次发出的图是不是 JPEG。 */
+  var sentBase = DS_VISION.snapshot().sent;
+  DS_VISION.setOptions({ region: 0.34, minGap: 0, debug: false });
+  var waited = 0;
+  while (DS_VISION.snapshot().sent === sentBase && waited < 3000) {
+    DS_VISION.forceStep();
+    await wait(120);
+    waited += 120;
+  }
+  var s1 = DS_VISION.snapshot();
+  I('确实把画面发出去识别了', s1.sent > sentBase, 'sent ' + sentBase + ' → ' + s1.sent + ' ok=' + s1.ok);
+  I('用的是 canvas 通道（不是退化的标签页截图）', s1.mode === 'canvas', s1.mode);
+  I('发出去的是 JPEG data URL',
+    /^data:image\/jpeg;base64,/.test(vLast),
+    vLast ? vLast.slice(0, 24) : '(无，' + waited + 'ms 内没收到)');
+
+  /* 画面一动不动时应该一直跳过 —— 这是这套东西不烧钱的关键。
+     注意窗口不能拉太长：无变化时还有一条「超过 MAX_GAP_MS（3 秒）强制补发一次」
+     的保险，跑满 3 秒就会正常地发出请求，那属于设计内行为、不是缺陷。
+     所以这里只跑 2 轮（≈400ms），确保量的纯粹是「没变化就不发」。 */
+  var gapBefore = DS_VISION.snapshot();
+  var sQuiet = await pumpFrames(2, 2500);
+  I('画面静止时不发请求（跳过占多数）', sQuiet.sent === gapBefore.sent,
+    'sent ' + gapBefore.sent + ' → ' + sQuiet.sent + '，skipped=' + sQuiet.skipped);
+  I('跳过计数确实在涨（说明在抓、只是没发）', sQuiet.skipped > gapBefore.skipped,
+    gapBefore.skipped + ' → ' + sQuiet.skipped);
+
+  /* 字幕换句要能被识别成「画面变了」。 */
+  var changesBefore = DS_VISION.snapshot().changes;
+  frame = 30;
+  paintSource();
+  await wait(400);                       // 让 captureStream 把新帧推给 video
+  var s2 = await pumpFrames(1);
+  I('字幕换句被识别为画面变化', s2.changes > changesBefore,
+    changesBefore + ' → ' + s2.changes + '，差分=' + s2.lastDiff.toFixed(3));
+
+  /* 认出来之后还得真的发出去。上一次发送可能刚过去不到 minGap，而且只有「画面又变了」
+     才会立刻重发。captureStream 推帧有几帧延迟，所以这里换帧之后多等一会儿，
+     并且用持续变化的画面（每轮都改宽度）确保一定推得出去。 */
+  DS_VISION.setOptions({ region: 0.34, minGap: 0, debug: false });
+  await wait(400);
+  var sentBefore = DS_VISION.snapshot().sent;
+  var tries = 0;
+  while (DS_VISION.snapshot().sent === sentBefore && tries < 12) {
+    frame += 15;
+    paintSource();
+    await wait(300);
+    DS_VISION.forceStep();
+    await wait(160);
+    tries++;
+  }
+  var s3 = DS_VISION.snapshot();
+  I('换句后重新发出了请求', s3.sent > s1.sent,
+    s1.sent + ' → ' + s3.sent + '（试了 ' + tries + ' 轮，差分=' + s3.lastDiff.toFixed(3) + '）');
+
+  var hostV = document.getElementById('__dssub_overlay_host__');
+  var zhV = hostV && hostV.shadowRoot && hostV.shadowRoot.querySelector('.zh');
+  I('识别结果被画到了覆盖层上', !!zhV && zhV.textContent.indexOf('第 ') === 0,
+    'host=' + !!hostV + ' shadow=' + !!(hostV && hostV.shadowRoot) +
+    ' zh=' + J(zhV && zhV.textContent) + ' vs snapshot=' + J(DS_VISION.snapshot().zh) +
+    ' mounted=' + DS_OVERLAY.isMounted() + ' target=' + (DS_OVERLAY.getTarget() === vv));
+
+  var zhBefore = zhV ? zhV.textContent : '';
+
+  /* 暂停时不发请求，但画面上的中文要留着。暂停是同步判定的，直接敲一轮看效果。 */
+  var sentBeforePause = DS_VISION.snapshot().sent;
+  vv.pause();
+  await wait(200);
+  I('暂停播放后不再发请求',
+    DS_VISION.snapshot().sent === sentBeforePause,
+    sentBeforePause + ' → ' + DS_VISION.snapshot().sent);
+  I('暂停时画面上那行中文仍留着',
+    (function () {
+      var h = document.getElementById('__dssub_overlay_host__');
+      var w = h && h.shadowRoot && h.shadowRoot.querySelector('.wrap');
+      var z = h && h.shadowRoot && h.shadowRoot.querySelector('.zh');
+      return !!w && w.classList.contains('on') && !!z && z.textContent === zhBefore && zhBefore !== '';
+    })(), zhBefore);
+
+  /* 画面说「没有字幕」时，延迟一小段再消失，避免字幕间隙疯狂闪烁。 */
+  __reply = function (msg) {
+    if (msg.type !== 'ds-translate-image') return { ok: true };
+    return { ok: true, found: false, src: '', zh: '' };
+  };
+  frame = 90;
+  paintSource();
+  try { vv.play().catch(function () {}); } catch (e) {}
+  DS_VISION.setOptions({ region: 0.34, minGap: 0, debug: false });
+  await wait(400);                       // 让 captureStream 把新帧推过去
+  /* 等到真的收到「无字幕」那一发为止。固定跑 3 轮是不够的：
+     换帧有延迟，第 1 轮很可能还在跟上一帧比、判定「没变化」直接跳过。 */
+  var holdWaited = 0;
+  while (DS_VISION.snapshot().holdMs === 0 && holdWaited < 3000) {
+    DS_VISION.forceStep();
+    await wait(150);
+    holdWaited += 150;
+  }
+  var midClear = (function () {
+    var h = document.getElementById('__dssub_overlay_host__');
+    var w = h && h.shadowRoot && h.shadowRoot.querySelector('.wrap');
+    return !!w && w.classList.contains('on');
+  })();
+  I('刚报「无字幕」时不立刻消失（防闪烁）', midClear === true);
+  /* 「暂存文案已清空」这一步得等 hold 窗口走完才会发生 —— 在那之前 curZh 故意留着，
+     这正是防闪烁的实现。这里只确认「收到了无字幕判定、已经在倒计时」。 */
+  I('确实收到了「无字幕」的判定（进入防闪烁倒计时）', DS_VISION.snapshot().holdMs > 0,
+    'holdMs=' + Math.round(DS_VISION.snapshot().holdMs) + '（等了 ' + holdWaited + 'ms）');
+
+  await wait(1600);
+  I('倒计时结束后暂存文案清空', DS_VISION.snapshot().zh === '', J(DS_VISION.snapshot().zh));
+  var afterClear = (function () {
+    var h = document.getElementById('__dssub_overlay_host__');
+    var w = h && h.shadowRoot && h.shadowRoot.querySelector('.wrap');
+    return !!w && w.classList.contains('on');
+  })();
+  I('超过保留时间后自动隐去', afterClear === false);
+
+  DS_VISION.stop();
+  I('stop() 之后不再运行', DS_VISION.isRunning() === false);
+
+  try { vv.srcObject = null; } catch (e) {}
+  if (vv.parentNode) vv.parentNode.removeChild(vv);
+  DS_OVERLAY.detach();
+
+  /* --- I3. 只在一条字幕源都没有时才接管 --- */
+  __reply = function () { return { ok: true }; };
+  window.fetch = realFetch;
+
+  /* E 块往页面里投过一份 sample.vtt，capture.js 一直缓着它；而 main.js 锁定的视频
+     只要还在，kind 就会保持在 'file'。两个都要清：先清缓冲，再让视频从页面上消失，
+     pickVideo() 才会走 resetCues()。 */
+  window.postMessage({ __dssub: '__dssub_reset_v1' }, '*');
+  var leftVideos = document.querySelectorAll('video');
+  for (var lv = 0; lv < leftVideos.length; lv++) {
+    if (leftVideos[lv].parentNode) leftVideos[lv].parentNode.removeChild(leftVideos[lv]);
+  }
+  await wait(800);
+
+  /* 用已有的 main.js 实例（F 块已经加载过）验一次编排层的门控逻辑。 */
+  var v3 = document.createElement('video');
+  v3.id = 'selftest-v3';
+  v3.style.cssText = 'position:fixed;left:30px;top:30px;width:520px;height:300px;background:#111';
+  Object.defineProperty(v3, 'currentTime', { value: 1, configurable: true });
+  Object.defineProperty(v3, 'paused', { value: true, configurable: true });   // 暂停着，别真去发请求
+  document.body.appendChild(v3);
+
+  /* main.js 是 250ms 一拍的定时器在 pickVideo()。刚 append 就查状态，
+     state.video 还是 null，ds-status 会走「没有视频」那条分支、根本不带 kind 字段，
+     断言就会拿到 undefined 而不是 'none' —— 那是测量时机的问题，不是门控的问题。 */
+  await wait(700);
+
+  /* 先确认源真的清干净了，再开读屏 —— 否则下面的断言会以「测了个假前提」通过。 */
+  var stClean = await new Promise(function (res) {
+    var l = __msgListeners[__msgListeners.length - 1];
+    l({ type: 'ds-status' }, {}, res);
+  });
+  I('测试前置：此时已无任何字幕源', !!stClean && stClean.kind === 'none',
+    (stClean && stClean.hasVideo ? 'kind=' + stClean.kind : '还没锁定视频'));
+
+  __store.screenReader = true;
+  __store.enabled = true;
+  __changeListeners.forEach(function (fn) { fn({ screenReader: { newValue: true } }, 'local'); });
+  await wait(700);
+
+  var stNoSrc = await new Promise(function (res) {
+    var l = __msgListeners[__msgListeners.length - 1];
+    l({ type: 'ds-status' }, {}, res);
+  });
+  I('没有字幕源时读屏自动接管', !!(stNoSrc && stNoSrc.screen && stNoSrc.screen.active),
+    J(stNoSrc && stNoSrc.screen && stNoSrc.screen.active));
+  I('读屏接管时字幕来源明确标成「读屏兜底」',
+    !!stNoSrc && /读屏兜底/.test(stNoSrc.source || ''), stNoSrc && stNoSrc.source);
+
+  /* setCues() 要求至少 2 条 cue 才认（一条的「字幕文件」多半是被误抓的碎片）。 */
+  var evtt = 'WEBVTT\n\n00:00:00.000 --> 00:00:05.000\nSome real subtitle\n\n' +
+    '00:00:05.000 --> 00:00:09.000\nAnother real subtitle\n';
+  window.postMessage({ __dssub: '__dssub_capture_v1', data: { url: 'https://host/real.vtt', body: evtt, page: location.href } }, '*');
+  await wait(800);
+
+  var stHasSrc = await new Promise(function (res) {
+    var l = __msgListeners[__msgListeners.length - 1];
+    l({ type: 'ds-status' }, {}, res);
+  });
+  I('一旦拿到真字幕文件，读屏立刻让位',
+    !!(stHasSrc && stHasSrc.screen && stHasSrc.screen.active === false),
+    J(stHasSrc && stHasSrc.screen && stHasSrc.screen.active));
+  I('让位后字幕来源回到「字幕文件」',
+    !!stHasSrc && stHasSrc.kind === 'file', stHasSrc && stHasSrc.kind);
+
+  __store.screenReader = false;
+  __changeListeners.forEach(function (fn) { fn({ screenReader: { newValue: false } }, 'local'); });
+  await wait(400);
+  if (v3.parentNode) v3.parentNode.removeChild(v3);
 
   /* ===================== 汇总 ===================== */
   stage('done');

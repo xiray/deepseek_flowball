@@ -15,7 +15,9 @@
 <!--
   空壳页：界面由 options.js 自己建。
   这里不能用内联脚本 —— MV3 扩展页的 CSP 禁止，逻辑必须放在外部文件里。
+  i18n.js 是界面语言词表，必须在 options.js 之前加载（options.js 一上来就要用）。
 -->
+<script src="i18n.js"></script>
 <script src="config.js"></script>
 <script src="options.js"></script>
 </body>

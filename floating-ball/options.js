@@ -13,7 +13,14 @@
 
   var cfg = window.DS_CONFIG || {};
   var K_KEY = '__ds_key__';
+  var K_LANG = '__ds_lang__';        // 'zh' | 'en'，只换这个设置页的文案
   var el = {};
+  var lang = 'zh';                   // 默认中文（这扩展本来就是中文优先，英文是给需要的人切的）
+  var NAME = (cfg.assistant && cfg.assistant.name) || 'DeepSeek';
+  // 最近一条状态提示 / 快捷键提示：切语言时要按新语言重画一遍。
+  // 存的是**词表 key + 参数**，不是拼好的字符串 —— 存字符串的话切过去还是老语言。
+  var lastSay = null;
+  var lastKeySt = null;
 
   // ---------- 存储 ----------
   function hasStore() {
@@ -57,11 +64,87 @@
   // 显示用：只露头和尾。别把整串铺在屏幕上 —— 截个图就漏了
   function mask(k) { return k.length <= 12 ? k.slice(0, 4) + '…' : (k.slice(0, 6) + '…' + k.slice(-4)); }
 
+  // ---------- 界面语言 ----------
+  // 词表在 i18n.js（window.DS_I18N），这里只负责「现在是哪个语言 + 怎么画上去」。
+  // 选过的语言存在 chrome.storage.local，下次打开还是这个语言。
+  function dict() {
+    var all = window.DS_I18N || {};
+    return all[lang] || all.zh || {};
+  }
+  function t(k, vars) {
+    var s = dict()[k];
+    if (s == null) { s = ((window.DS_I18N || {}).zh || {})[k]; }   // 缺了就回落中文，别把 key 露出去
+    if (s == null) { s = k; }
+    if (vars) {
+      s = String(s).replace(/\{(\w+)\}/g, function (m, n) {
+        return vars[n] == null ? '' : vars[n];
+      });
+    }
+    return s;
+  }
+  function readLang() {
+    return new Promise(function (res) {
+      try {
+        if (hasStore()) {
+          chrome.storage.local.get(K_LANG, function (d) {
+            res(d && d[K_LANG] === 'en' ? 'en' : 'zh');
+          });
+          return;
+        }
+      } catch (e) { /* 落到下面 */ }
+      res('zh');
+    });
+  }
+  function writeLang(v) {
+    try {
+      if (hasStore()) { chrome.storage.local.set(kv(K_LANG, v)); }
+    } catch (e) { /* 存不进去就只在这一次生效，不影响用 */ }
+  }
+  function setLang(v) {
+    lang = (v === 'en') ? 'en' : 'zh';
+    writeLang(lang);
+    applyLang();
+    return Promise.resolve(lang);
+  }
+  // 把当前语言画到界面上：写死的文案走 data-i18n（纯文本）/ data-i18n-html（带标签），
+  // 算出来的那几块（显示/隐藏、状态行、快捷键）各自重画一次 —— 它们不是静态文本。
+  function applyLang() {
+    document.documentElement.setAttribute('lang', lang === 'en' ? 'en' : 'zh-CN');
+    document.title = t('page.title', { name: NAME });
+    var root = el.root;
+    if (root && root.querySelectorAll) {
+      root.querySelectorAll('[data-i18n]').forEach(function (n) {
+        n.textContent = t(n.getAttribute('data-i18n'), { name: NAME });
+      });
+      root.querySelectorAll('[data-i18n-html]').forEach(function (n) {
+        n.innerHTML = t(n.getAttribute('data-i18n-html'), { name: NAME });
+      });
+      root.querySelectorAll('[data-i18n-ph]').forEach(function (n) {
+        n.setAttribute('placeholder', t(n.getAttribute('data-i18n-ph')));
+      });
+    }
+    if (el.lang) { el.lang.value = lang; }
+    syncShowBtn();
+    renderSay();
+    renderKeySt();
+    // 「当前已配置」「快捷键」两行也是文案，重读重画一遍（异步，但渲染时读的是新 lang）
+    refresh();
+  }
+
   // ---------- 样式 ----------
   var CSS = [
     '.dsopt{max-width:660px;margin:0 auto;padding:34px 22px 60px;',
     'font:14px/1.68 "Segoe UI",system-ui,-apple-system,"Microsoft YaHei",sans-serif;color:#1b1d20}',
     '.dsopt h1{font-size:20px;font-weight:600;margin:0 0 10px}',
+    // 标题 + 语言下拉排在一行；窗口窄了就换行，别让下拉被挤出去
+    '.dsopt .head{display:flex;align-items:center;justify-content:space-between;gap:14px;',
+    'flex-wrap:wrap;margin:0 0 8px}',
+    '.dsopt .head h1{margin:0}',
+    '.dsopt .langpick{display:flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;color:#5b6169}',
+    '.dsopt .langpick select{font:inherit;font-size:12.5px;padding:5px 8px;border-radius:8px;',
+    'border:1px solid rgba(0,0,0,.18);background:#fff;color:inherit;outline:0;cursor:pointer}',
+    '.dsopt .langpick select:focus{border-color:#4D6BFE;box-shadow:0 0 0 3px rgba(77,107,254,.13)}',
+    '.dsopt .langnote{color:#6a7076;font-size:12px;margin:0 0 16px}',
     '.dsopt .lead{color:#5b6169;font-size:13px;margin:0 0 22px}',
     '.dsopt code{font-family:ui-monospace,Consolas,"Courier New",monospace;font-size:12.5px;',
     'background:rgba(0,0,0,.06);padding:1px 5px;border-radius:5px}',
@@ -94,7 +177,10 @@
     '.dsopt a{color:#3f5ae0}',
     '@media (prefers-color-scheme: dark){',
     '.dsopt{color:#eceef1}',
-    '.dsopt .lead,.dsopt .st,.dsopt .cur,.dsopt .foot,.dsopt .legacy p,.dsopt .hint{color:#a6abb3}',
+    '.dsopt .lead,.dsopt .st,.dsopt .cur,.dsopt .foot,.dsopt .legacy p,.dsopt .hint,',
+    '.dsopt .langnote{color:#a6abb3}',
+    '.dsopt .langpick{color:#a6abb3}',
+    '.dsopt .langpick select{background:#1c1d20;border-color:rgba(255,255,255,.2)}',
     '.dsopt code{background:rgba(255,255,255,.12)}',
     '.dsopt .kbd{background:rgba(255,255,255,.12)}',
     '.dsopt .card{background:#232428;border-color:rgba(255,255,255,.14);box-shadow:none}',
@@ -117,53 +203,55 @@
     var root = document.createElement('div');
     root.className = 'dsopt';
     root.innerHTML = ''
-      + '<h1>' + esc(cfg.assistant && cfg.assistant.name ? cfg.assistant.name : 'DeepSeek') + ' 悬浮球 · 设置</h1>'
-      + '<p class="lead">API Key 只存在这台电脑的浏览器里（<code>chrome.storage.local</code>），'
-      + '网页读不到它；只有发请求那一刻才拿出来放进 <code>Authorization</code> 头，'
-      + '直接发给 <code>api.deepseek.com</code>，不经过任何第三方。代码里不会有它。</p>'
+      + '<div class="head">'
+      + '  <h1 data-i18n="page.h1"></h1>'
+      + '  <label class="langpick"><span data-i18n="lang.label"></span>'
+      + '    <select id="dso-lang"><option value="zh">中文</option><option value="en">English</option></select>'
+      + '  </label>'
+      + '</div>'
+      + '<p class="langnote" data-i18n="lang.hint"></p>'
+      + '<p class="lead" data-i18n-html="page.lead"></p>'
 
       + '<div class="card">'
-      + '  <label for="dso-key">API Key</label>'
+      + '  <label for="dso-key" data-i18n="key.label"></label>'
       + '  <div class="row">'
-      + '    <input id="dso-key" type="password" spellcheck="false" autocomplete="off" placeholder="sk-……">'
-      + '    <button class="btn ghost" id="dso-show" type="button">显示</button>'
+      + '    <input id="dso-key" type="password" spellcheck="false" autocomplete="off" data-i18n-ph="key.placeholder">'
+      + '    <button class="btn ghost" id="dso-show" type="button"></button>'
       + '  </div>'
       + '  <div class="row2">'
-      + '    <button class="btn" id="dso-save" type="button">保存</button>'
-      + '    <button class="btn ghost" id="dso-test" type="button">测试连接</button>'
-      + '    <button class="btn ghost danger" id="dso-clear" type="button">清空</button>'
+      + '    <button class="btn" id="dso-save" type="button" data-i18n="btn.save"></button>'
+      + '    <button class="btn ghost" id="dso-test" type="button" data-i18n="btn.test"></button>'
+      + '    <button class="btn ghost danger" id="dso-clear" type="button" data-i18n="btn.clear"></button>'
       + '  </div>'
       + '  <p class="st" id="dso-st"></p>'
       + '  <p class="cur" id="dso-cur"></p>'
       + '</div>'
 
       + '<div class="card legacy" id="dso-legacy" hidden>'
-      + '  <b>config.js 里还留着一串旧 key</b>'
-      + '  <p>它是 <code id="dso-legacy-val"></code>。现在不用写在文件里了 —— '
-      + '点下面「搬进浏览器」，再去把 config.js 里 <code>apiKey:</code> 那行清空（或整行删掉）就干净了。</p>'
-      + '  <div class="row2"><button class="btn" id="dso-move" type="button">搬进浏览器</button></div>'
+      + '  <b data-i18n="legacy.title"></b>'
+      // ⚠ 那个 <code id="dso-legacy-val"> 必须留在被翻译的 span **外面**：
+      //   它会往 innerHTML 里塞，整段重写的话这个节点就换了，el 里抓着的是旧的那个（显示不出来）
+      + '  <p><span data-i18n="legacy.pre"></span> <code id="dso-legacy-val"></code>'
+      + '<span data-i18n-html="legacy.post"></span></p>'
+      + '  <div class="row2"><button class="btn" id="dso-move" type="button" data-i18n="btn.move"></button></div>'
       + '</div>'
 
       + '<div class="card">'
-      + '  <label>唤起快捷键</label>'
-      + '  <p class="cur" id="dso-key-now">正在读……</p>'
-      + '  <div class="row2"><button class="btn ghost" id="dso-keys" type="button">去改快捷键</button></div>'
+      + '  <label data-i18n="keys.label"></label>'
+      + '  <p class="cur" id="dso-key-now" data-i18n="keys.reading"></p>'
+      + '  <div class="row2"><button class="btn ghost" id="dso-keys" type="button" data-i18n="btn.keys"></button></div>'
       + '  <p class="st" id="dso-key-st"></p>'
-      + '  <p class="hint">默认 <b class="kbd">Alt + 空格</b> 开 / 收面板（新标签页、设置页、PDF 这些'
-      + '「球进不去」的地方会开右侧栏），<b class="kbd">Alt + Q</b> 把网页上选中的文字送进面板（只挂起来，'
-      + '不自动发送，等你补一句）。</p>'
-      + '  <p class="hint">Chrome 不让扩展自己改快捷键（安全限制），只能去 Chrome 自己那个页面改 —— '
-      + '按钮点开就是。</p>'
+      + '  <p class="hint" data-i18n-html="keys.hint"></p>'
+      + '  <p class="hint" data-i18n="keys.limit"></p>'
       + '</div>'
 
-      + '<p class="foot">申请 / 管理 Key：'
-      + '<a href="https://platform.deepseek.com/api_keys" target="_blank" rel="noopener noreferrer">'
-      + 'platform.deepseek.com/api_keys</a>'
-      + '　·　模型和思考强度在面板底部那两个下拉框里改，跟这里没关系。</p>';
+      + '<p class="foot" data-i18n-html="foot"></p>';
 
     document.body.appendChild(root);
 
     el = {
+      root: root,
+      lang: root.querySelector('#dso-lang'),
       key: root.querySelector('#dso-key'),
       show: root.querySelector('#dso-show'),
       save: root.querySelector('#dso-save'),
@@ -180,6 +268,9 @@
     };
 
     el.show.addEventListener('click', function () { toggleShow(); });
+    // 换语言：不重建 DOM（重建会把已经粘进输入框、还没保存的 Key 抹掉），
+    // 只把文字重画一遍 —— 输入框里打的东西原样留着。
+    el.lang.addEventListener('change', function () { setLang(el.lang.value); });
     el.save.addEventListener('click', function () { save(); });
     el.test.addEventListener('click', function () { test(); });
     el.clear.addEventListener('click', function () { clear(); });
@@ -191,25 +282,25 @@
   }
 
   // ---------- 唤起快捷键（manifest 里的 commands.toggle-panel） ----------
-  // Chrome 报回来的键名（Alt+Space、Ctrl+Shift+Comma…）翻成人看的样子。
+  // 键名表也跟着语言走（在 i18n.js 的 keyNames 里）：中文「空格」/ 英文「Space」。
   // 只翻 Chrome 允许出现在快捷键里的那几个特殊键，字母数字原样。
-  var KEY_NAME = {
-    Space: '空格', Comma: '逗号', Period: '句号',
-    Up: '↑', Down: '↓', Left: '←', Right: '→',
-    MediaNextTrack: '媒体下一首', MediaPrevTrack: '媒体上一首',
-    MediaPlayPause: '播放/暂停', MediaStop: '停止播放'
-  };
+  function keyNames() {
+    var all = window.DS_I18N || {};
+    var d = all[lang] || {};
+    return d.keyNames || (all.zh && all.zh.keyNames) || {};
+  }
   function keyLabel(s) {
+    var names = keyNames();
     return String(s || '').split('+').map(function (p) {
       var k = p.trim();
-      return k ? (KEY_NAME[k] || k) : '';
+      return k ? (names[k] || k) : '';
     }).filter(Boolean).join(' + ');
   }
 
-  // 我们自己声明的那两条（名字要和 manifest 里的 commands 对齐）
+  // 我们自己声明的那两条（name 要和 manifest 里的 commands 对齐；label 是词表 key）
   var OUR_KEYS = [
-    { name: 'toggle-panel', label: '打开 / 收起面板' },
-    { name: 'ask-selection', label: '把选中的文字送进面板' }
+    { name: 'toggle-panel', label: 'keys.openPanel' },
+    { name: 'ask-selection', label: 'keys.sendSel' }
   ];
 
   // 读当前快捷键。返回：{命令名: 键位}（''=没设）/ null = 这个环境读不到。
@@ -239,17 +330,11 @@
     try {
       if (chrome.tabs && chrome.tabs.create) {
         chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
-        if (el.keySt) {
-          el.keySt.className = 'st ok';
-          el.keySt.textContent = '已打开 Chrome 的快捷键页；没看到的话手动访问 chrome://extensions/shortcuts';
-        }
+        setKeySt('keys.opened', 'ok');
         return true;
       }
     } catch (e) { /* 落到下面 */ }
-    if (el.keySt) {
-      el.keySt.className = 'st warn';
-      el.keySt.textContent = '这个环境打不开，请手动访问 chrome://extensions/shortcuts';
-    }
+    setKeySt('keys.openFail', 'warn');
     return false;
   }
 
@@ -257,13 +342,16 @@
     return readShortcuts().then(function (sc) {
       if (!el.keyNow) { return sc; }
       if (sc === null) {
-        el.keyNow.textContent = '这个环境读不到快捷键设置（不影响扩展本身）。';
+        el.keyNow.textContent = t('keys.noApi');
         return sc;
       }
+      // ⚠ label 要先 t() 再 esc()：直接 esc(key) 会把词表 key 原样印在页面上
       el.keyNow.innerHTML = OUR_KEYS.map(function (k) {
         var v = sc[k.name];
-        return esc(k.label) + '：' + (v ? '<b class="kbd">' + esc(keyLabel(v)) + '</b>'
-                                       : '<span class="kbd">还没设</span>');
+        return t('keys.line', {
+          label: esc(t(k.label)),
+          value: v ? '<b class="kbd">' + esc(keyLabel(v)) + '</b>' : t('keys.unset')
+        });
       }).join('<br>');
       return sc;
     });
@@ -275,22 +363,41 @@
     });
   }
 
-  function say(msg, kind) {
-    el.st.className = 'st' + (kind ? ' ' + kind : '');
-    el.st.textContent = msg || '';
+  // 状态提示存的是「词表 key + 参数」，不是拼好的句子 —— 存句子的话，切语言之后这条
+  // 还是老语言挂在那儿，看着像没切成功。
+  function say(key, kind, vars) {
+    lastSay = { key: key, kind: kind || '', vars: vars || null };
+    renderSay();
+  }
+  function renderSay() {
+    if (!el.st) { return; }
+    if (!lastSay) { el.st.className = 'st'; el.st.textContent = ''; return; }
+    el.st.className = 'st' + (lastSay.kind ? ' ' + lastSay.kind : '');
+    el.st.textContent = t(lastSay.key, lastSay.vars);
+  }
+  function setKeySt(key, kind) {
+    lastKeySt = { key: key, kind: kind || '' };
+    renderKeySt();
+  }
+  function renderKeySt() {
+    if (!el.keySt) { return; }
+    if (!lastKeySt) { el.keySt.className = 'st'; el.keySt.textContent = ''; return; }
+    el.keySt.className = 'st' + (lastKeySt.kind ? ' ' + lastKeySt.kind : '');
+    el.keySt.textContent = t(lastKeySt.key);
   }
 
   function toggleShow() {
     var hidden = el.key.type === 'password';
     el.key.type = hidden ? 'text' : 'password';
-    el.show.textContent = hidden ? '隐藏' : '显示';
+    syncShowBtn();
+  }
+  function syncShowBtn() {
+    if (el.show) { el.show.textContent = t(el.key.type === 'password' ? 'btn.show' : 'btn.hide'); }
   }
 
   function refresh() {
     return readKey().then(function (k) {
-      el.cur.textContent = k
-        ? '当前已配置：' + mask(k) + '（存在浏览器里，代码里没有）'
-        : '当前还没配 Key —— 配好之前，面板里发消息会提示你去配。';
+      el.cur.textContent = k ? t('cur.on', { v: mask(k) }) : t('cur.off');
       var lg = legacyKey();
       el.legacy.hidden = !lg;
       if (lg) { el.legacyVal.textContent = mask(lg); }
@@ -305,22 +412,20 @@
 
   function save() {
     var v = norm(el.key.value);
-    if (!v) { say('还没填内容。', 'bad'); el.key.focus(); return Promise.resolve(false); }
+    if (!v) { say('msg.empty', 'bad'); el.key.focus(); return Promise.resolve(false); }
     return writeKey(v).then(function (ok) {
-      if (!ok) { say('存不进去：这个页面没跑在扩展里（要用扩展详情页的「扩展选项」打开）。', 'bad'); return false; }
-      say(/^sk-/.test(v)
-        ? '已保存。Key 现在在浏览器里了，代码里没有。'
-        : '已保存 —— 不过它不以 sk- 开头，DeepSeek 的 Key 一般是 sk- 开头，确认一下没粘错。',
-        /^sk-/.test(v) ? 'ok' : 'warn');
+      if (!ok) { say('msg.noStore', 'bad'); return false; }
+      var looksGood = /^sk-/.test(v);
+      say(looksGood ? 'msg.saved' : 'msg.savedOdd', looksGood ? 'ok' : 'warn');
       return refresh().then(function () { return true; });
     });
   }
 
   function clear() {
-    if (!window.confirm('清空后要重新填才能用，确定？')) { return Promise.resolve(false); }
+    if (!window.confirm(t('msg.confirmClear'))) { return Promise.resolve(false); }
     return dropKey().then(function () {
       el.key.value = '';
-      say('已清空。', 'warn');
+      say('msg.cleared', 'warn');
       return refresh();
     });
   }
@@ -329,7 +434,7 @@
     var lg = legacyKey();
     if (!lg) { return Promise.resolve(false); }
     return writeKey(lg).then(function () {
-      say('旧 key 已搬进浏览器。接下来把 config.js 里 apiKey 那行清空，代码里就彻底没有了。', 'ok');
+      say('msg.moved', 'ok');
       return refresh();
     });
   }
@@ -338,10 +443,10 @@
   // 不需要它真答出内容来（max_tokens 给 1，最省）。
   function test() {
     var v = norm(el.key.value);
-    if (!v) { say('先把 Key 填进上面那个框。', 'bad'); el.key.focus(); return Promise.resolve(null); }
+    if (!v) { say('msg.needKey', 'bad'); el.key.focus(); return Promise.resolve(null); }
     var base = String(cfg.apiBase || 'https://api.deepseek.com').replace(/\/+$/, '');
     var model = cfg.model || 'deepseek-flash';
-    say('正在测（拿 ' + model + ' 打一次接口）…');
+    say('msg.testing', '', { model: model });
     return fetch(base + (cfg.apiPath || '/chat/completions'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + v },
@@ -352,27 +457,32 @@
         stream: false
       })
     }).then(function (r) {
-      if (r.ok) { say('✓ 通了，Key 是活的。', 'ok'); return r.status; }
-      var why = r.status === 401 ? 'Key 不对（401）'
-        : r.status === 402 ? '余额不足（402）'
-        : r.status === 429 ? '请求太频繁（429），等一下再试'
-        : '接口返回 HTTP ' + r.status;
-      say('✗ ' + why, 'bad');
+      if (r.ok) { say('msg.testOk', 'ok'); return r.status; }
+      var byCode = r.status === 401 ? 'msg.test401'
+        : r.status === 402 ? 'msg.test402'
+        : r.status === 429 ? 'msg.test429' : '';
+      if (byCode) { say(byCode, 'bad'); } else { say('msg.testHttp', 'bad', { code: r.status }); }
       return r.status;
     }).catch(function (e) {
-      say('✗ 连不上：' + ((e && e.message) || e) + '（检查网络 / 代理）', 'bad');
+      say('msg.testFail', 'bad', { err: (e && e.message) || e });
       return null;
     });
   }
 
+  // 先按中文把界面建出来（万一是读存储失败，页面也不该是空的），再把存过的语言画上去。
+  // 顺序反过来也能用，但"空白等存储回调"在扩展页里会有一下闪空，不值当。
   build();
-  refresh();
+  applyLang();                       // 里面会 refresh() 一次
+  readLang().then(function (l) {
+    if (l !== lang) { lang = l; applyLang(); }
+  });
 
   // 给自检页用（也给以后想从面板里直接改 Key 留个口子）
   window.__dsOptions = {
     save: save, test: test, clear: clear, refresh: refresh,
     moveLegacy: moveLegacy, mask: mask,
     keyLabel: keyLabel, syncKeys: syncKeys, openKeys: openKeys, readShortcuts: readShortcuts,
+    setLang: setLang, getLang: function () { return lang; },
     els: function () { return el; }
   };
 })();
